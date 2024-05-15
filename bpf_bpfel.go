@@ -12,7 +12,7 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfPktEvent struct {
+type BpfPktEvent struct {
 	Timestamp     uint64
 	PktLen        uint32
 	PktOffset     uint32
@@ -47,7 +47,7 @@ func loadBpf() (*ebpf.CollectionSpec, error) {
 //	*bpfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func LoadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 	spec, err := loadBpf()
 	if err != nil {
 		return err
@@ -81,12 +81,12 @@ type bpfMapSpecs struct {
 // bpfObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
-type bpfObjects struct {
+type BpfObjects struct {
 	bpfPrograms
 	bpfMaps
 }
 
-func (o *bpfObjects) Close() error {
+func (o *BpfObjects) Close() error {
 	return _BpfClose(
 		&o.bpfPrograms,
 		&o.bpfMaps,
