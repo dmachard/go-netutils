@@ -7,22 +7,6 @@ import (
 	"os"
 )
 
-const (
-	TLSV10 = "1.0"
-	TLSV11 = "1.1"
-	TLSV12 = "1.2"
-	TLSV13 = "1.3"
-)
-
-var (
-	TLSVersion = map[string]uint16{
-		TLSV10: tls.VersionTLS10,
-		TLSV11: tls.VersionTLS11,
-		TLSV12: tls.VersionTLS12,
-		TLSV13: tls.VersionTLS13,
-	}
-)
-
 var clientCipherSuites = []uint16{
 	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
