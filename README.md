@@ -6,8 +6,9 @@ Network utilities in Golang
 - Generate BPF filter: (ip4 || ip6) && (tcp || udp) && port == int
 - Get EBPF program to inject in kernel (XDP DNS filter)
 - Easy config for TLS
+- String IPv4/v6 CIDR parser to net.IPMask
 
-## Generate eBPF bytecode
+## Build eBPF bytecode
 
 Install prerequisites
 
@@ -28,4 +29,21 @@ Compiles a C source file into eBPF bytecode
 ```bash
 cd xdp/
 go generate .
+```
+
+## Running tests
+
+```bash
+$ go test -cover -v
+```
+
+## Examples
+### String CIDR parser
+
+```go
+v4Mask, err = netutils.parseCIDRMask("10.0.0.0/8")
+if err != nil {
+   fmt.Println(err)
+}
+// v4Mask == net.CIDRMask(8, 32)
 ```
