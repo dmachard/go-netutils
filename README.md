@@ -41,7 +41,7 @@ $ go test -cover -v
 ### String CIDR parser
 
 ```go
-v4Mask, err = netutils.parseCIDRMask("10.0.0.0/8")
+v4Mask, err = netutils.ParseCIDRMask("10.0.0.0/8")
 if err != nil {
    fmt.Println(err)
 }

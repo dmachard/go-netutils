@@ -28,7 +28,7 @@ func TestParseCIDRMask(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.mask, func(t *testing.T) {
-			result, err := parseCIDRMask(tt.mask)
+			result, err := ParseCIDRMask(tt.mask)
 			if (err != nil) != tt.expectErr {
 				t.Errorf("unexpected error status: got %v, want %v, error: %v", (err != nil), tt.expectErr, err)
 			}

@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-func parseCIDRMask(mask string) (net.IPMask, error) {
+func ParseCIDRMask(mask string) (net.IPMask, error) {
 	parts := strings.Split(mask, "/")
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid mask format, expected /integer: %s", mask)
