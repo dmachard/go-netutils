@@ -5,7 +5,7 @@ go 1.21.0
 toolchain go1.22.3
 
 require (
-	github.com/cilium/ebpf v0.15.0
+	github.com/cilium/ebpf v0.16.0
 	github.com/google/gopacket v1.1.19
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/net v0.27.0
