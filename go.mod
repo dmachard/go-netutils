@@ -8,7 +8,7 @@ require (
 	github.com/cilium/ebpf v0.16.0
 	github.com/google/gopacket v1.1.19
 	github.com/stretchr/testify v1.9.0
-	golang.org/x/net v0.28.0
+	golang.org/x/net v0.29.0
 	golang.org/x/sys v0.25.0
 )
 
