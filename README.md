@@ -1,3 +1,5 @@
+<img src="https://img.shields.io/badge/go%20version-min%201.21-green" alt="Go version"/>
+
 # go-netutils
 
 Network utilities in Golang
