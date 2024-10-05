@@ -73,3 +73,25 @@ if err != nil {
    fmt.Println(err)
 }
 ```
+
+### TLS client config
+
+
+```go
+import (
+	"github.com/dmachard/go-netutils"
+)
+
+tlsOptions := netutils.TLSOptions{
+   InsecureSkipVerify: true,
+   MinVersion:         "1.2",
+   CAFile:             "",
+   CertFile:           "",
+   KeyFile:            "",
+}
+
+tlsConfig, err := netutils.TLSClientConfig(tlsOptions)
+if err != nil {
+   w.LogFatal("logger=kafka - tls config failed:", err)
+}
+```

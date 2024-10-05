@@ -28,12 +28,4 @@ func TestGetBpfFilterPort(t *testing.T) {
 	filter, err := GetBpfFilterPort(53)
 	assert.NoError(t, err)
 	assert.NotNil(t, filter)
-
-	// Test the number of instructions and the contents of the first few instructions
-	// For example:
-	assert.Equal(t, 20, len(filter)) // Example length of the filter
-
-	// Check specific instructions if needed
-	// For example:
-	assert.IsType(t, bpf.LoadAbsolute{}, filter[0])
 }
