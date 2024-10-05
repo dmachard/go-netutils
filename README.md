@@ -43,9 +43,33 @@ $ go test -cover -v
 ### String CIDR parser
 
 ```go
+import (
+	"github.com/dmachard/go-netutils"
+)
+
 v4Mask, err = netutils.ParseCIDRMask("10.0.0.0/8")
 if err != nil {
    fmt.Println(err)
 }
 // v4Mask == net.CIDRMask(8, 32)
+```
+
+### Generate BPF filter
+
+```go
+import (
+	"github.com/dmachard/go-netutils"
+)
+
+
+fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, netutils.Htons(syscall.ETH_P_ALL))
+if err != nil {
+   fmt.Println(err)
+}
+
+filter := GetBpfFilterPort(53)
+err = netutils.ApplyBpfFilter(filter, fd)
+if err != nil {
+   fmt.Println(err)
+}
 ```
