@@ -9,6 +9,7 @@ Network utilities in Golang
 - Get EBPF program to inject in kernel (XDP DNS filter)
 - Easy config for TLS
 - String IPv4/v6 CIDR parser to net.IPMask
+- Minimal network decoder for gopacket
 
 ## Build eBPF bytecode
 
@@ -94,4 +95,21 @@ tlsConfig, err := netutils.TLSClientConfig(tlsOptions)
 if err != nil {
    w.LogFatal("logger=kafka - tls config failed:", err)
 }
+```
+
+### Minimal network layers decoders
+
+```go
+import (
+	"github.com/dmachard/go-netutils"
+)
+
+netDecoder := &netutils.NetDecoder{}
+
+// copy packet data from buffer
+pkt := make([]byte, bufN)
+copy(pkt, buf[:bufN])
+
+// decode minimal layers
+packet := gopacket.NewPacket(pkt, netDecoder, gopacket.NoCopy)
 ```
