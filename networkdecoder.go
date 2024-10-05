@@ -15,6 +15,8 @@ const (
 	IPv6ProtocolTCP      = layers.IPProtocolTCP
 	IPv6ProtocolUDP      = layers.IPProtocolUDP
 	IPv6ProtocolFragment = layers.IPProtocolIPv6Fragment
+	IPv4ProtocolGRE      = layers.IPProtocolGRE
+	IPv6ProtocolGRE      = layers.IPProtocolGRE
 )
 
 func (d *NetDecoder) Decode(data []byte, p gopacket.PacketBuilder) error {
@@ -52,6 +54,8 @@ func (d *NetDecoder) decodeIPv4(data []byte, p gopacket.PacketBuilder) error {
 		return d.decodeTCP(ipv4Layer.Payload, p)
 	case IPv4ProtocolUDP:
 		return d.decodeUDP(ipv4Layer.Payload, p)
+	case IPv4ProtocolGRE:
+		return d.decodeGRE(ipv4Layer.Payload, p)
 	}
 
 	return nil
@@ -74,6 +78,8 @@ func (d *NetDecoder) decodeIPv6(data []byte, p gopacket.PacketBuilder) error {
 		return d.decodeUDP(ipv6Layer.Payload, p)
 	case IPv6ProtocolFragment:
 		return d.decodeIPv6Fragment(ipv6Layer.Payload, p)
+	case IPv6ProtocolGRE:
+		return d.decodeGRE(ipv6Layer.Payload, p)
 	}
 	return nil
 }
@@ -121,6 +127,25 @@ func (d *NetDecoder) decodeUDP(data []byte, p gopacket.PacketBuilder) error {
 	}
 	p.AddLayer(udpLayer)
 	p.SetTransportLayer(udpLayer)
+
+	return nil
+}
+
+func (d *NetDecoder) decodeGRE(data []byte, p gopacket.PacketBuilder) error {
+	// Decode the GRE layer
+	greLayer := &layers.GRE{}
+	if err := greLayer.DecodeFromBytes(data, p); err != nil {
+		return err
+	}
+	p.AddLayer(greLayer)
+
+	// Process inner payload based on the protocol in the GRE header
+	switch greLayer.Protocol {
+	case layers.EthernetTypeIPv4:
+		return d.decodeIPv4(greLayer.Payload, p)
+	case layers.EthernetTypeIPv6:
+		return d.decodeIPv6(greLayer.Payload, p)
+	}
 
 	return nil
 }
