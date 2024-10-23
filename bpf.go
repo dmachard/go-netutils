@@ -105,17 +105,11 @@ func GetBpfFilterPort(port int) ([]bpf.Instruction, error) {
 	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x2c}, "accept_packet", "")              // fragment ?
 	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x11}, "read_ipv6_port", "")             // ip.proto == UDP ?
 	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x6}, "read_ipv6_port", "ignore_packet") // ip.proto == TCP ?
-	//bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x2f}, "read_ipv6_gre", "ignore_packet")      // If nxt == GRE, goto read_gre
 	bpfInstructions.Label("read_ipv6_port")
 	bpfInstructions.Add(bpf.LoadAbsolute{Off: 54, Size: 2}, "", "")                                           // Load source port tcp or udp (2 bytes at offset 54)
 	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(port)}, "accept_packet", "")              // source port equal to 53 ?
 	bpfInstructions.Add(bpf.LoadAbsolute{Off: 56, Size: 2}, "", "")                                           // Load destination port tcp or udp (2 bytes at offset 56)
 	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(port)}, "accept_packet", "ignore_packet") // destination port equal to 53 ?
-
-	// Read GRE packet
-	bpfInstructions.Label("read_ipv4_gre")
-	bpfInstructions.Add(bpf.LoadAbsolute{Off: 36, Size: 2}, "", "")                        // Load GRE protocol type from header (2 bytes at offset 36)
-	bpfInstructions.Add(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x0800}, "accept_packet", "") // If GRE proto == IPv4, goto read_gre_ipv4
 
 	// Keep the packet and send up to 65k of the packet to userspace
 	bpfInstructions.Label("accept_packet")
