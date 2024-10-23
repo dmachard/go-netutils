@@ -5,7 +5,7 @@
 Network utilities in Golang
 - TCP assembly stream for dns packets
 - Generic IP defrag function
-- [Generate BPF filter: (ip4 || ip6) && (tcp || udp) && port == int](#generate-bpf-filter)
+- [Generate BPF filter: (ip4 || ip6) && (tcp || udp) && port == int with GRE support](#generate-bpf-filter)
 - Get EBPF program to inject in kernel (XDP DNS filter)
 - [Easy config for TLS](#tls-client-config)
 - [String IPv4/v6 CIDR parser to net.IPMask](#string-cidr-parser)

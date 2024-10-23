@@ -41,14 +41,20 @@ func Test_GetBpfFilterPort_FromPcap(t *testing.T) {
 		nbPackets int
 	}{
 		{
-			name:      "IPv4 DNS UDP over GRE",
+			name:      "DNS/UDP/IPv4 over GRE/IPv4",
 			pcapFile:  "./pcap/gre_ipv4_dns_udp.pcap",
 			port:      53, // DNS port
 			nbPackets: 2,
 		},
 		{
-			name:      "IPv4 DNS UDP over GRE - 2nd sample",
-			pcapFile:  "./pcap/gre_ipv4_dns_udp_2.pcap",
+			name:      "DNS/TCP/IPv4 over GRE/IPv4",
+			pcapFile:  "./pcap/gre_ipv4_dns_tcp.pcap",
+			port:      53, // DNS port
+			nbPackets: 20,
+		},
+		{
+			name:      "DNS/UDP/IPv4 over GRE/IPv4 with key",
+			pcapFile:  "./pcap/gre+key_ipv4_dns_udp.pcap",
 			port:      53, // DNS port
 			nbPackets: 2,
 		},
