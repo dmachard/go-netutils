@@ -21,7 +21,10 @@ jobs:
     - uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.go-version }}
-        
+
+    - name: Install libpcap-dev
+      run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+       
     - name: Test
       run: go test -cover -v
 

@@ -5,11 +5,11 @@
 Network utilities in Golang
 - TCP assembly stream for dns packets
 - Generic IP defrag function
-- Generate BPF filter: (ip4 || ip6) && (tcp || udp) && port == int
+- [Generate BPF filter: (ip4 || ip6) && (tcp || udp) && port == int with GRE support](#generate-bpf-filter)
 - Get EBPF program to inject in kernel (XDP DNS filter)
-- Easy config for TLS
-- String IPv4/v6 CIDR parser to net.IPMask
-- Minimal network decoder for gopacket
+- [Easy config for TLS](#tls-client-config)
+- [String IPv4/v6 CIDR parser to net.IPMask](#string-cidr-parser)
+- [Minimal network decoder for gopacket](#minimal-network-layers-decoders)
 
 ## Build eBPF bytecode
 
@@ -37,6 +37,8 @@ go generate .
 ## Running tests
 
 ```bash
+$ apt install -y libpcap-dev
+
 $ go test -cover -v
 ```
 
@@ -68,7 +70,10 @@ if err != nil {
    fmt.Println(err)
 }
 
-filter := GetBpfFilterPort(53)
+filter, err := netutils.GetBpfFilterPort(53)
+if err != nil {
+   fmt.Println(err)
+}
 err = netutils.ApplyBpfFilter(filter, fd)
 if err != nil {
    fmt.Println(err)
