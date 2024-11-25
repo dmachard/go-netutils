@@ -41,22 +41,58 @@ func Test_GetBpfFilterPort_FromPcap(t *testing.T) {
 		nbPackets int
 	}{
 		{
-			name:      "DNS/UDP/IPv4 over GRE/IPv4",
-			pcapFile:  "./pcap/gre_ipv4_dns_udp.pcap",
-			port:      53, // DNS port
+			name:      "IP4>UDP>DNS",
+			pcapFile:  "./pcap/dns_ipv4_udp.pcap",
+			port:      53,
 			nbPackets: 2,
 		},
 		{
-			name:      "DNS/TCP/IPv4 over GRE/IPv4",
+			name:      "IP4>TCP>DNS",
+			pcapFile:  "./pcap/dns_ipv4_tcp.pcap",
+			port:      53,
+			nbPackets: 10,
+		},
+		{
+			name:      "IP4>GRE>IP4>UDP>DNS",
+			pcapFile:  "./pcap/gre_ipv4_dns_udp.pcap",
+			port:      53,
+			nbPackets: 2,
+		},
+		{
+			name:      "IP4>GRE>IP4>UDP>DNS (with key)",
+			pcapFile:  "./pcap/gre_ipv4_dns_udp_2.pcap",
+			port:      53,
+			nbPackets: 2,
+		},
+		{
+			name:      "IP4>GRE>IP4>TCP>DNS",
 			pcapFile:  "./pcap/gre_ipv4_dns_tcp.pcap",
-			port:      53, // DNS port
+			port:      53,
 			nbPackets: 20,
 		},
 		{
-			name:      "DNS/UDP/IPv4 over GRE/IPv4 with key",
-			pcapFile:  "./pcap/gre+key_ipv4_dns_udp.pcap",
-			port:      53, // DNS port
+			name:      "IP6>UDP>DNS",
+			pcapFile:  "./pcap/dns_ipv6_udp.pcap",
+			port:      53,
 			nbPackets: 2,
+		},
+		{
+			name:      "IP6>TCP>DNS",
+			pcapFile:  "./pcap/dns_ipv6_tcp.pcap",
+			port:      53,
+			nbPackets: 10,
+		},
+		{
+			name:      "IP6>GRE>IP6>UDP>DNS",
+			pcapFile:  "./pcap/gre_ipv6_dns_udp.pcap",
+			port:      5301,
+			nbPackets: 2,
+		},
+		{
+			name:      "IP6>GRE>IP6>TCP>DNS",
+			pcapFile:  "./pcap/gre_ipv6_dns_tcp.pcap",
+			port:      5301,
+			nbPackets: 10,
 		},
 	}
 
