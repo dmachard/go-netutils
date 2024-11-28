@@ -10,13 +10,14 @@ import (
 type NetDecoder struct{}
 
 const (
-	IPv4ProtocolTCP      = layers.IPProtocolTCP
-	IPv4ProtocolUDP      = layers.IPProtocolUDP
-	IPv6ProtocolTCP      = layers.IPProtocolTCP
-	IPv6ProtocolUDP      = layers.IPProtocolUDP
-	IPv6ProtocolFragment = layers.IPProtocolIPv6Fragment
-	IPv4ProtocolGRE      = layers.IPProtocolGRE
-	IPv6ProtocolGRE      = layers.IPProtocolGRE
+	IPv4ProtocolTCP         = layers.IPProtocolTCP
+	IPv4ProtocolUDP         = layers.IPProtocolUDP
+	IPv6ProtocolTCP         = layers.IPProtocolTCP
+	IPv6ProtocolUDP         = layers.IPProtocolUDP
+	IPv6ProtocolFragment    = layers.IPProtocolIPv6Fragment
+	IPv4ProtocolGRE         = layers.IPProtocolGRE
+	IPv6ProtocolGRE         = layers.IPProtocolGRE
+	IPv6ProtocolDestination = layers.IPProtocolIPv6Destination
 )
 
 func (d *NetDecoder) Decode(data []byte, p gopacket.PacketBuilder) error {
@@ -70,18 +71,50 @@ func (d *NetDecoder) decodeIPv6(data []byte, p gopacket.PacketBuilder) error {
 	p.AddLayer(ipv6Layer)
 	p.SetNetworkLayer(ipv6Layer)
 
+	nextHeader := ipv6Layer.NextHeader
+	payload := ipv6Layer.Payload
+
 	// Check the NextHeader of the IPv6 layer to determine the next layer
-	switch ipv6Layer.NextHeader {
-	case IPv6ProtocolTCP:
-		return d.decodeTCP(ipv6Layer.Payload, p)
-	case IPv6ProtocolUDP:
-		return d.decodeUDP(ipv6Layer.Payload, p)
-	case IPv6ProtocolFragment:
-		return d.decodeIPv6Fragment(ipv6Layer.Payload, p)
-	case IPv6ProtocolGRE:
-		return d.decodeGRE(ipv6Layer.Payload, p)
+	for {
+		switch nextHeader {
+		case IPv6ProtocolTCP:
+			return d.decodeTCP(payload, p)
+		case IPv6ProtocolUDP:
+			return d.decodeUDP(payload, p)
+		case IPv6ProtocolFragment:
+			return d.decodeIPv6Fragment(payload, p)
+		case IPv6ProtocolGRE:
+			return d.decodeGRE(payload, p)
+		case IPv6ProtocolDestination:
+			var err error
+			nextHeader, payload, err = d.parseIPv6Extension(nextHeader, payload)
+			if err != nil {
+				return err
+			}
+		default:
+			return nil // Unhandled protocol or no more headers
+		}
 	}
-	return nil
+}
+
+// parseIPv6Extension processes IPv6 extension headers and returns the next header and payload
+func (d *NetDecoder) parseIPv6Extension(currentHeader layers.IPProtocol, payload []byte) (layers.IPProtocol, []byte, error) {
+	if len(payload) < 8 {
+		return 0, nil, fmt.Errorf("IPv6 extension header too short for %v", currentHeader)
+	}
+
+	nextHeader := layers.IPProtocol(payload[0])  // First byte is the NextHeader
+	extensionLength := (int(payload[1]) + 1) * 8 // Length is in 8-byte units
+
+	if extensionLength == 0 {
+		return 0, nil, fmt.Errorf("IPv6 extension header length is zero for %v", currentHeader)
+	}
+	if len(payload) < extensionLength {
+		return 0, nil, fmt.Errorf("IPv6 extension header exceeds payload length for %v", currentHeader)
+	}
+
+	// Return updated nextHeader and trimmed payload
+	return nextHeader, payload[extensionLength:], nil
 }
 
 func (d *NetDecoder) decodeIPv6Fragment(data []byte, p gopacket.PacketBuilder) error {
