@@ -182,3 +182,25 @@ func (d *NetDecoder) decodeGRE(data []byte, p gopacket.PacketBuilder) error {
 
 	return nil
 }
+
+// to support sniffing on gre tunnel
+// no ethernet layer in this case
+type RawIPDecoder struct {
+	baseDecoder *NetDecoder
+}
+
+func (d *RawIPDecoder) Decode(data []byte, p gopacket.PacketBuilder) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty packet data")
+	}
+
+	version := (data[0] >> 4) & 0x0F
+	switch version {
+	case 4: // IPv4
+		return d.baseDecoder.decodeIPv4(data, p)
+	case 6: // IPv6
+		return d.baseDecoder.decodeIPv6(data, p)
+	default:
+		return fmt.Errorf("unsupported IP version: %d", version)
+	}
+}
