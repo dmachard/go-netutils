@@ -68,7 +68,8 @@ func Test_GetBpfFilterDnsPort_FromPcap(t *testing.T) {
 			defer handle.Close()
 
 			// Get BPF filter for the specified port
-			bpfInstructions, err := GetBpfDnsFilterPort(tt.port)
+			hasEther := true
+			bpfInstructions, err := GetBpfDnsFilterPort(tt.port, hasEther)
 			if err != nil {
 				t.Fatalf("failed to get BPF filter: %v", err)
 			}
