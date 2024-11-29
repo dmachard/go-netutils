@@ -7,6 +7,11 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
+// interface for network decoder
+type PacketDecoder interface {
+	Decode(data []byte, p gopacket.PacketBuilder) error
+}
+
 type NetDecoder struct{}
 
 const (

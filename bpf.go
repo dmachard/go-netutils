@@ -109,14 +109,21 @@ func (lr *LabelResolver) ResolveJumps() ([]bpf.Instruction, error) {
 	return finalInstructions, nil
 }
 
-func GetBpfDnsFilterPort(port int) ([]bpf.Instruction, error) {
+func GetBpfDnsFilterPort(port int, withEthernet bool) ([]bpf.Instruction, error) {
 	bpfInstructions := &LabelResolver{LabelMap: make(map[string]int)}
 
 	// IPv4, IPv6 protocol condition from ethernet layer
-	bpfInstructions.Add(bpf.LoadConstant{Dst: bpf.RegX, Val: ethLen})                                  // X = 14
-	bpfInstructions.Add(bpf.LoadAbsolute{Off: 12, Size: 2})                                            // A = pkt[12:14] = eth.type (2 bytes)
-	bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x0800}, "read_ipv4", "")              // A == IPv4 ?
-	bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x86dd}, "read_ipv6", "ignore_packet") // A == IPv6 ?
+	if withEthernet {
+		bpfInstructions.Add(bpf.LoadConstant{Dst: bpf.RegX, Val: ethLen})                                  // X = 14
+		bpfInstructions.Add(bpf.LoadAbsolute{Off: 12, Size: 2})                                            // A = pkt[12:14] = eth.type (2 bytes)
+		bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x0800}, "read_ipv4", "")              // A == IPv4 ?
+		bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x86dd}, "read_ipv6", "ignore_packet") // A == IPv6 ?
+	} else {
+		bpfInstructions.Add(bpf.LoadConstant{Dst: bpf.RegX, Val: 0})                                       // X = 0
+		bpfInstructions.Add(bpf.LoadAbsolute{Off: 0, Size: 1})                                             // A = pkt[0] (to byte to detect IPv4/IPv6)
+		bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x40}, "read_ipv4", "")              // IPv4 : Version == 4 (0x4*)
+		bpfInstructions.JumpIf(bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x60}, "read_ipv6", "ignore_packet") // IPv6 : Version == 6 (0x6*)
+	}
 
 	// Read IPv4 layer
 	bpfInstructions.Label("read_ipv4")
