@@ -1,4 +1,4 @@
-<img src="https://img.shields.io/badge/go%20version-min%201.24-green" alt="Go version"/>
+<img src="https://img.shields.io/badge/go%20version-min%201.25-green" alt="Go version"/>
 
 # go-netutils
 
