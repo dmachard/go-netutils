@@ -3,7 +3,7 @@ module github.com/dmachard/go-netutils
 go 1.25.0
 
 require (
-	github.com/cilium/ebpf v0.21.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/google/gopacket v1.1.19
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/net v0.56.0
