@@ -10,11 +10,11 @@ on:
 
 jobs:
   testing:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     
     strategy:
       matrix:
-        go-version: ['1.25','1.26']
+        go-version: ['1.25','1.26','1.27']
         
     steps:
     - uses: actions/checkout@v7
