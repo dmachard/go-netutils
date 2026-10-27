@@ -49,16 +49,15 @@ func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
 	var inFragMore bool
 
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
-		inIP6 := in.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
 		inFrag6 := in.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
 		inFragOffset = inFrag6.FragmentOffset * 8
-		inFragLength = inIP6.Length - 8
+		inFragLength = uint16(len(inFrag6.Payload))
 		inFragMore = inFrag6.MoreFragments
 	}
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
 		inIP4 := in.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
 		inFragOffset = inIP4.FragOffset * 8
-		inFragLength = inIP4.Length - 20
+		inFragLength = uint16(len(inIP4.Payload))
 		inFragMore = inIP4.Flags&layers.IPv4MoreFragments > 0
 	}
 
@@ -112,40 +111,37 @@ func (f *fragments) build(in gopacket.Packet) (gopacket.Packet, error) {
 		pack, _ := e.Value.(gopacket.Packet)
 
 		var fragOffset uint16
-		var fragLength uint16
 		var fragPayload []byte
-		var ipOffset uint16
 
 		if pack.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
 			frag6 := pack.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
-			ip6 := pack.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
 
 			fragOffset = frag6.FragmentOffset
-			fragLength = ip6.Length
 			fragPayload = frag6.Payload
-			ipOffset = 8
 		}
 		if pack.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
 			ip4 := pack.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
 
 			fragOffset = ip4.FragOffset
-			fragLength = ip4.Length
 			fragPayload = ip4.Payload
-			ipOffset = 20
 		}
 
+		// Take the length from the decoded payload, not from the header. A
+		// header length that is wrong or that ignores IP options must not
+		// make the slice below go past the end of the payload.
+		fragLength := uint16(len(fragPayload))
 		offset := fragOffset * 8
 		switch {
 		case offset == currentOffset:
 			final = append(final, fragPayload...)
-			currentOffset = currentOffset + fragLength - ipOffset
+			currentOffset += fragLength
 		case offset < currentOffset:
-			startAt := currentOffset - fragOffset*8
-			if startAt > fragLength-ipOffset {
+			startAt := currentOffset - offset
+			if startAt > fragLength {
 				return nil, fmt.Errorf("defrag: invalid fragment")
 			}
 			final = append(final, fragPayload[startAt:]...)
-			currentOffset += fragOffset * 8
+			currentOffset = offset + fragLength
 		default:
 			// Houston - we have an hole !
 			return nil, fmt.Errorf("defrag: hole found")
@@ -381,6 +377,11 @@ func (d *IPDefragmenter) dontDefrag(in gopacket.Packet) bool {
 }
 
 func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
+	// a fragment with less data than its header claims can't be reassembled
+	if in.Metadata().Truncated {
+		return fmt.Errorf("fragment truncated")
+	}
+
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
 		frag6 := in.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
 
@@ -408,11 +409,15 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 		if ip4.FragOffset > IPv4MaximumFragmentOffset {
 			return fmt.Errorf("fragment offset too big (handcrafted? %d > %d)", ip4.FragOffset, IPv4MaximumFragmentOffset)
 		}
-		fragOffset := ip4.FragOffset * 8
+		if int(fragSize) != len(ip4.Payload) {
+			return fmt.Errorf("fragment truncated (%d < %d)", len(ip4.Payload), fragSize)
+		}
 
-		// don't allow fragment that would oversize an IP packet
-		if fragOffset+ip4.Length > IPv4MaximumSize {
-			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+ip4.Length, IPv4MaximumSize)
+		// don't allow fragment that would oversize an IP packet, in uint32 so
+		// that the sum can't wrap around
+		fragOffset := uint32(ip4.FragOffset) * 8
+		if fragOffset+uint32(ip4.Length) > IPv4MaximumSize {
+			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+uint32(ip4.Length), IPv4MaximumSize)
 		}
 	}
 
