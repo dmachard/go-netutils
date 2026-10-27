@@ -20,6 +20,16 @@ const (
 	IPv4MaximumSize            = 65535 // Maximum size of a fragment (2^16)
 	IPv4MaximumFragmentOffset  = 8183  // Maximum offset of a fragment
 	IPv4MaximumFragmentListLen = 8192  // Back out if we get more than this many fragments
+
+	// The same defaults as the Linux ipfrag_time and ipfrag_high_thresh sysctls.
+	// Without them, a flow that never completes stays in memory forever.
+	IPFragmentTimeout     = 30 * time.Second // Drop a flow that got no fragment for this long
+	IPFragmentMemoryLimit = 4 << 20          // Drop the least recently seen flows above this many bytes
+
+	// fragmentOverhead is the measured heap cost of one stored fragment, in
+	// addition to its captured bytes. Without it, small fragments would hold
+	// many times the memory limit.
+	fragmentOverhead = 1024
 )
 
 type fragments struct {
@@ -27,6 +37,10 @@ type fragments struct {
 	Highest  uint16
 	Current  uint16
 	LastSeen time.Time
+
+	key  ipFlow
+	size int           // bytes charged to IPFragmentMemoryLimit
+	elem *list.Element // position in IPDefragmenter.lru
 }
 
 func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
@@ -76,8 +90,6 @@ func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
 			}
 		}
 	}
-
-	f.LastSeen = in.Metadata().Timestamp
 
 	// After inserting the Fragment, we update the counters
 	if f.Highest < inFragOffset+inFragLength {
@@ -244,11 +256,16 @@ func newIPv6(packet gopacket.Packet) ipFlow {
 type IPDefragmenter struct {
 	sync.RWMutex
 	ipFlows map[ipFlow]*fragments
+	// lru holds the flows from least to most recently seen.
+	lru         list.List
+	size        int
+	memoryLimit int
 }
 
 func NewIPDefragmenter() *IPDefragmenter {
 	return &IPDefragmenter{
-		ipFlows: make(map[ipFlow]*fragments),
+		ipFlows:     make(map[ipFlow]*fragments),
+		memoryLimit: IPFragmentMemoryLimit,
 	}
 }
 
@@ -279,31 +296,64 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 		maxFrag = IPv6MaximumFragmentListLen
 	}
 	d.Lock()
+	defer d.Unlock()
+
+	// Use the capture time, not the wall clock, so that a pcap file replay
+	// expires flows the same way as a live capture.
+	now := in.Metadata().Timestamp
+	d.expire(now.Add(-IPFragmentTimeout))
+
 	fl, exist = d.ipFlows[ipf]
 	if !exist {
-		fl = new(fragments)
+		fl = &fragments{key: ipf}
+		fl.elem = d.lru.PushBack(fl)
 		d.ipFlows[ipf] = fl
+	} else {
+		d.lru.MoveToBack(fl.elem)
 	}
-	d.Unlock()
+	fl.LastSeen = now
 
 	// insert, and if final build it
+	before := fl.List.Len()
 	out, err2 := fl.insert(in)
+	if fl.List.Len() > before {
+		cost := len(in.Data()) + fragmentOverhead
+		fl.size += cost
+		d.size += cost
+	}
 
 	// at last, if we hit the maximum frag list len
 	// without any defrag success, we just drop everything and
 	// raise an error
 	if out == nil && fl.List.Len()+1 > maxFrag {
-		d.flush(ipf)
+		d.remove(fl)
 		return nil, fmt.Errorf("fragment List hits its maximum")
 	}
 
 	// if we got a packet, it's a new one, and he is defragmented
 	// when defrag is done for a flow between two ip clean the list
 	if out != nil {
-		d.flush(ipf)
+		d.remove(fl)
 		return out, nil
 	}
-	return nil, err2
+
+	// a flow that failed to build can never complete
+	if err2 != nil {
+		d.remove(fl)
+		return nil, err2
+	}
+
+	// Drop the oldest flows first. Flows that never complete pile up at the
+	// front, and a new DNS flow at the back usually completes within
+	// milliseconds.
+	for e := d.lru.Front(); e != nil && d.size > d.memoryLimit; e = d.lru.Front() {
+		oldest := e.Value.(*fragments)
+		d.remove(oldest)
+		if oldest == fl {
+			return nil, fmt.Errorf("fragment memory limit reached")
+		}
+	}
+	return nil, nil
 }
 
 func (d *IPDefragmenter) dontDefrag(in gopacket.Packet) bool {
@@ -369,19 +419,32 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 	return nil
 }
 
-func (d *IPDefragmenter) flush(ipf ipFlow) {
-	d.Lock()
-	delete(d.ipFlows, ipf)
-	d.Unlock()
+// remove must be called with the lock held.
+func (d *IPDefragmenter) remove(fl *fragments) {
+	delete(d.ipFlows, fl.key)
+	d.lru.Remove(fl.elem)
+	d.size -= fl.size
+}
+
+// expire removes the flows last seen before t. It must be called with the
+// lock held. It stops at the first recent flow, so it costs little per packet.
+func (d *IPDefragmenter) expire(t time.Time) {
+	for e := d.lru.Front(); e != nil; e = d.lru.Front() {
+		fl := e.Value.(*fragments)
+		if !fl.LastSeen.Before(t) {
+			return
+		}
+		d.remove(fl)
+	}
 }
 
 func (d *IPDefragmenter) DiscardOlderThan(t time.Time) int {
 	var nb int
 	d.Lock()
-	for k, v := range d.ipFlows {
-		if v.LastSeen.Before(t) {
+	for _, fl := range d.ipFlows {
+		if fl.LastSeen.Before(t) {
 			nb++
-			delete(d.ipFlows, k)
+			d.remove(fl)
 		}
 	}
 	d.Unlock()

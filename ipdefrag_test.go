@@ -191,6 +191,7 @@ func TestIpDefrag_IPv4IncompleteFlowsAreBounded(t *testing.T) {
 		}
 	}
 
+	checkDefragmenter(t, defragger)
 	const limit = 8 << 20
 	if n := trackedBytes(defragger); n > limit {
 		t.Errorf("defragmenter holds %d bytes of incomplete flows, want at most %d", n, limit)
