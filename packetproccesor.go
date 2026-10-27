@@ -91,7 +91,9 @@ func IPDefragger(ipInput chan gopacket.Packet, udpOutput chan gopacket.Packet, t
 	for fragment := range ipInput {
 		reassembled, err := defragger.DefragIP(fragment)
 		if err != nil {
-			break
+			// Drop only this fragment. A return here stops all capture,
+			// because nothing else reads ipInput.
+			continue
 		}
 		if reassembled == nil {
 			continue
