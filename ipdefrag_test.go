@@ -285,3 +285,29 @@ func TestIpDefrag_IPv4FragmentsWithOptions(t *testing.T) {
 		t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
 	}
 }
+
+// One fragment with a far-future capture time must not stop the expiry of the
+// flows that come after it.
+func TestIpDefrag_IPv4FutureTimestampDoesNotStopExpiry(t *testing.T) {
+	defragger := NewIPDefragmenter()
+	start := time.Unix(1700000000, 0)
+	src := net.IP{10, 0, 0, 1}
+
+	future := newIPv4Fragment(t, src, 1, 185, true, make([]byte, 100), start.Add(100*365*24*time.Hour))
+	if _, err := defragger.DefragIP(future); err != nil {
+		t.Fatalf("unexpected error for the future fragment: %v", err)
+	}
+
+	// One fragment per second for 1000 seconds, each in its own flow.
+	for i := 0; i < 1000; i++ {
+		frag := newIPv4Fragment(t, src, uint16(i+2), 185, true, make([]byte, 100), start.Add(time.Duration(i)*time.Second))
+		if _, err := defragger.DefragIP(frag); err != nil {
+			t.Fatalf("unexpected error for fragment %d: %v", i, err)
+		}
+	}
+
+	checkDefragmenter(t, defragger)
+	if n := len(defragger.ipFlows); n > int(IPFragmentTimeout/time.Second)+2 {
+		t.Errorf("%d flows tracked, want at most the last %v of flows", n, IPFragmentTimeout)
+	}
+}

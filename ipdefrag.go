@@ -297,7 +297,7 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 	// Use the capture time, not the wall clock, so that a pcap file replay
 	// expires flows the same way as a live capture.
 	now := in.Metadata().Timestamp
-	d.expire(now.Add(-IPFragmentTimeout))
+	d.expire(now)
 
 	fl, exist = d.ipFlows[ipf]
 	if !exist {
@@ -314,6 +314,11 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 	out, err2 := fl.insert(in)
 	if fl.List.Len() > before {
 		cost := len(in.Data()) + fragmentOverhead
+		if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
+			// NetDecoder decodes the IPv6 fragment header into a second
+			// packet, which holds a second copy of the data.
+			cost += len(in.Data())
+		}
 		fl.size += cost
 		d.size += cost
 	}
@@ -431,12 +436,18 @@ func (d *IPDefragmenter) remove(fl *fragments) {
 	d.size -= fl.size
 }
 
-// expire removes the flows last seen before t. It must be called with the
-// lock held. It stops at the first recent flow, so it costs little per packet.
-func (d *IPDefragmenter) expire(t time.Time) {
+// expire removes the flows last seen more than IPFragmentTimeout away from
+// now, in the past or in the future. It must be called with the lock held. It
+// stops at the first recent flow, so it costs little per packet.
+//
+// A flow from the future comes from a clock step back or from one bad
+// timestamp. Without the future check, such a flow at the front of lru would
+// stop all expiry until the clock caught up.
+func (d *IPDefragmenter) expire(now time.Time) {
 	for e := d.lru.Front(); e != nil; e = d.lru.Front() {
 		fl := e.Value.(*fragments)
-		if !fl.LastSeen.Before(t) {
+		age := now.Sub(fl.LastSeen)
+		if age <= IPFragmentTimeout && age >= -IPFragmentTimeout {
 			return
 		}
 		d.remove(fl)
