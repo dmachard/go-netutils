@@ -138,8 +138,7 @@ func (f *fragments) build(in gopacket.Packet) (gopacket.Packet, error) {
 		outPacket.Metadata().Length = len(outPacket.Data())
 		outPacket.Metadata().Timestamp = in.Metadata().Timestamp
 
-		// workaround to mark the packet as reassembled
-		outPacket.Metadata().Truncated = true
+		markReassembled(outPacket)
 		return outPacket, nil
 	}
 
@@ -174,8 +173,7 @@ func (f *fragments) build(in gopacket.Packet) (gopacket.Packet, error) {
 		outPacket.Metadata().Length = len(outPacket.Data())
 		outPacket.Metadata().Timestamp = in.Metadata().Timestamp
 
-		// workaround to mark the packet as reassembled
-		outPacket.Metadata().Truncated = true
+		markReassembled(outPacket)
 
 		return outPacket, nil
 	}
@@ -307,6 +305,26 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 		}
 	}
 	return nil, nil
+}
+
+// reassembledMark marks a packet that build reassembled.
+type reassembledMark struct{}
+
+// markReassembled marks out in AncillaryData, because a decoder can also set
+// Truncated. Truncated stays set for callers that read it.
+func markReassembled(out gopacket.Packet) {
+	out.Metadata().Truncated = true
+	out.Metadata().AncillaryData = append(out.Metadata().AncillaryData, reassembledMark{})
+}
+
+// isReassembled reports whether p is a datagram that build reassembled.
+func isReassembled(p gopacket.Packet) bool {
+	for _, data := range p.Metadata().AncillaryData {
+		if _, ok := data.(reassembledMark); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *IPDefragmenter) dontDefrag(in gopacket.Packet) bool {
