@@ -66,25 +66,15 @@ func encodeFuzzPackets(steps []int8, pkts ...[]byte) []byte {
 	return out
 }
 
-// fuzzDefragIP runs the input once per decoder in testDecoders.
-func fuzzDefragIP(t *testing.T, data []byte, first gopacket.LayerType) {
+// decodeFuzzPackets decodes a fuzz input with dec. It returns the fragments of
+// the first layer type, the packets that DNS-collector sends to the
+// defragmenter.
+func decodeFuzzPackets(data []byte, first gopacket.LayerType, dec testDecoder) []gopacket.Packet {
 	ethType := layers.EthernetTypeIPv4
 	if first == layers.LayerTypeIPv6 {
 		ethType = layers.EthernetTypeIPv6
 	}
-	for _, dec := range testDecoders {
-		fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
-			frame := make([]byte, 14, 14+len(raw))
-			binary.BigEndian.PutUint16(frame[12:], uint16(ethType))
-			return dec.decodeFrame(append(frame, raw...))
-		})
-	}
-}
-
-func fuzzDefragIPWith(t *testing.T, data []byte, first gopacket.LayerType, decode func([]byte) gopacket.Packet) {
-	d := NewIPDefragmenter()
-	// A small limit, so that short inputs reach the eviction path.
-	d.memoryLimit = 4 * fragmentOverhead
+	var pkts []gopacket.Packet
 	ts := time.Unix(1700000000, 0)
 	for len(data) >= 3 {
 		n := int(binary.BigEndian.Uint16(data))
@@ -94,12 +84,13 @@ func fuzzDefragIPWith(t *testing.T, data []byte, first gopacket.LayerType, decod
 		if n > len(data) {
 			n = len(data)
 		}
-		pkt := decode(data[:n])
+		frame := make([]byte, 14, 14+n)
+		binary.BigEndian.PutUint16(frame[12:], uint16(ethType))
+		pkt := dec.decodeFrame(append(frame, data[:n]...))
 		data = data[n:]
 		if pkt.NetworkLayer() == nil || pkt.NetworkLayer().LayerType() != first {
 			continue
 		}
-		// DNS-collector only sends packets with a fragment to the defragmenter.
 		if first == layers.LayerTypeIPv4 {
 			ip4, ok := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
 			if !ok || (ip4.Flags&layers.IPv4MoreFragments == 0 && ip4.FragOffset == 0) {
@@ -109,8 +100,21 @@ func fuzzDefragIPWith(t *testing.T, data []byte, first gopacket.LayerType, decod
 			continue
 		}
 		pkt.Metadata().Timestamp = ts
-		_, _ = d.DefragIP(pkt)
-		checkDefragmenter(t, d)
+		pkts = append(pkts, pkt)
+	}
+	return pkts
+}
+
+// fuzzDefragIP runs the input once per decoder in testDecoders.
+func fuzzDefragIP(t *testing.T, data []byte, first gopacket.LayerType) {
+	for _, dec := range testDecoders {
+		d := NewIPDefragmenter()
+		// A small limit, so that short inputs reach the eviction path.
+		d.memoryLimit = 4 * fragmentOverhead
+		for _, pkt := range decodeFuzzPackets(data, first, dec) {
+			_, _ = d.DefragIP(pkt)
+			checkDefragmenter(t, d)
+		}
 	}
 }
 
@@ -146,5 +150,66 @@ func FuzzDefragIPv6(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		fuzzDefragIP(t, data, layers.LayerTypeIPv6)
+	})
+}
+
+// FuzzIPDefragger sends the fuzz packets to the IPDefragger goroutine, then a
+// DNS query in two fragments. No input may stop the goroutine or the
+// reassembly of the query, because nothing restarts the goroutine.
+func FuzzIPDefragger(f *testing.F) {
+	frag1, frag2 := dnsQueryIPv4Fragments()
+	f.Add(encodeFuzzPackets([]int8{1, 1}, frag1.Data(), frag2.Data()), false)
+	frag1, frag2 = dnsQueryIPv6Fragments()
+	f.Add(encodeFuzzPackets([]int8{1, 1}, frag1.Data(), frag2.Data()), true)
+	tooBig := newIPv4Fragment(f, net.IP{10, 0, 0, 1}, 1, IPv4MaximumFragmentOffset+1, false, make([]byte, 8), time.Time{})
+	f.Add(encodeFuzzPackets([]int8{0}, tooBig.Data()), false)
+
+	f.Fuzz(func(t *testing.T, data []byte, ipv6 bool) {
+		first, query := layers.LayerTypeIPv4, dnsQueryIPv4Fragments
+		if ipv6 {
+			first, query = layers.LayerTypeIPv6, dnsQueryIPv6Fragments
+		}
+		for _, dec := range testDecoders {
+			frag1, frag2 := query()
+			pkts := decodeFuzzPackets(data, first, dec)
+			queryFlow := frag1.NetworkLayer().NetworkFlow()
+			// A fuzz fragment in the flow of the query can drop it on purpose.
+			sharesFlow := false
+			for _, pkt := range pkts {
+				sharesFlow = sharesFlow || pkt.NetworkLayer().NetworkFlow() == queryFlow
+			}
+
+			ipInput := make(chan gopacket.Packet)
+			udpOutput := make(chan gopacket.Packet, len(pkts)+1)
+			tcpOutput := make(chan gopacket.Packet, len(pkts)+1)
+			done := make(chan struct{})
+			go func() {
+				IPDefragger(ipInput, udpOutput, tcpOutput, 53)
+				close(done)
+			}()
+			send := func(p gopacket.Packet) {
+				select {
+				case ipInput <- p:
+				case <-time.After(time.Second):
+					t.Fatal("the defragger no longer reads its input")
+				}
+			}
+			for _, pkt := range pkts {
+				send(pkt)
+			}
+			send(dec.decode(frag1))
+			send(dec.decode(frag2))
+			close(ipInput)
+			<-done
+
+			found := false
+			for len(udpOutput) > 0 {
+				pkt := <-udpOutput
+				found = found || pkt.NetworkLayer().NetworkFlow() == queryFlow
+			}
+			if !found && !sharesFlow {
+				t.Fatalf("%s: DNS query not reassembled after %d fuzz fragments", dec.name, len(pkts))
+			}
+		}
 	})
 }
