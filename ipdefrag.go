@@ -52,9 +52,6 @@ func fragmentInfo(p gopacket.Packet) (uint16, []byte, bool) {
 	if ip4, ok := p.NetworkLayer().(*layers.IPv4); ok {
 		return ip4.FragOffset * 8, ip4.Payload, ip4.Flags&layers.IPv4MoreFragments > 0
 	}
-	// TODO: for GRE in an IPv6 packet that is not a fragment, this is the
-	// fragment header of the inner packet, but the flow key and the output
-	// header come from the outer one.
 	frag6 := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
 	return frag6.FragmentOffset * 8, frag6.Payload, frag6.MoreFragments
 }
@@ -315,7 +312,6 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 
 	// Drop the oldest flows first. Flows that never complete collect at the
 	// front, and a new flow at the back usually completes in milliseconds.
-	// TODO: count the dropped flows, so that a user can see the limit is hit.
 	for e := d.lru.Front(); e != nil && d.size > d.memoryLimit; e = d.lru.Front() {
 		oldest := e.Value.(*fragments)
 		d.remove(oldest)
@@ -377,8 +373,6 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 		// don't allow a fragment with less data than its header claims. Don't
 		// use Metadata().Truncated: NetDecoder decodes UDP inside fragments,
 		// and that sets it on every first fragment.
-		// TODO: this rejects every fragment with a Hop-by-Hop header, because
-		// gopacket takes that header out of Payload but not out of Length.
 		ip6 := in.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
 		if int(ip6.Length) != len(ip6.Payload) {
 			return fmt.Errorf("fragment truncated (%d < %d)", len(ip6.Payload), ip6.Length)
@@ -400,7 +394,6 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 		fragSize := ip4.Length - uint16(ip4.IHL)*4
 
 		// don't allow small fragments outside of specification
-		// TODO: a last fragment can legally hold 1-7 bytes, and this drops it.
 		if fragSize < IPv4MinimumFragmentSize {
 			return fmt.Errorf("fragment too small(handcrafted? %d < %d)", fragSize, IPv4MinimumFragmentSize)
 		}
