@@ -43,13 +43,15 @@ type fragments struct {
 }
 
 // fragmentInfo returns the offset in bytes, the payload, and the more
-// fragments flag of a fragment.
+// fragments flag of a fragment. It checks the network layer first: NetDecoder
+// decodes GRE inside an IPv4 fragment, so the packet can also hold the IPv6
+// fragment header of an inner packet, which securityChecks did not check.
 func fragmentInfo(p gopacket.Packet) (uint16, []byte, bool) {
-	if frag6, ok := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment); ok {
-		return frag6.FragmentOffset * 8, frag6.Payload, frag6.MoreFragments
+	if ip4, ok := p.NetworkLayer().(*layers.IPv4); ok {
+		return ip4.FragOffset * 8, ip4.Payload, ip4.Flags&layers.IPv4MoreFragments > 0
 	}
-	ip4 := p.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-	return ip4.FragOffset * 8, ip4.Payload, ip4.Flags&layers.IPv4MoreFragments > 0
+	frag6 := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
+	return frag6.FragmentOffset * 8, frag6.Payload, frag6.MoreFragments
 }
 
 // insert keeps the fragments sorted by offset. It ignores an exact duplicate

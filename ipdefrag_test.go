@@ -2,6 +2,7 @@ package netutils
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -471,4 +472,59 @@ func BenchmarkDefragIP(b *testing.B) {
 			}
 		})
 	}
+}
+
+// NetDecoder decodes GRE inside any IPv4 fragment, so a fragment can also hold
+// the IPv6 fragment header of an inner packet. The defragmenter must use the
+// IPv4 header, or a sender controls the offset and length of the fragment.
+func TestIpDefrag_IPv4FragmentWithInnerIPv6Fragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		// GRE, then an IPv6 header, a fragment header at the highest offset,
+		// and a UDP header.
+		inner := []byte{0x00, 0x00, 0x86, 0xdd}
+		ip6 := make([]byte, 40)
+		ip6[0] = 0x60
+		binary.BigEndian.PutUint16(ip6[4:], 8+8+24)
+		ip6[6] = byte(layers.IPProtocolIPv6Fragment)
+		ip6[7] = 64
+		copy(ip6[8:], net.ParseIP("fd00::1"))
+		copy(ip6[24:], net.ParseIP("fd00::2"))
+		inner = append(inner, ip6...)
+		frag6 := make([]byte, 8)
+		frag6[0] = byte(layers.IPProtocolUDP)
+		binary.BigEndian.PutUint16(frag6[2:], IPv6MaximumFragmentOffset<<3)
+		inner = append(inner, frag6...)
+		udp := make([]byte, 8+24)
+		binary.BigEndian.PutUint16(udp[0:], 1234)
+		binary.BigEndian.PutUint16(udp[2:], 53)
+		binary.BigEndian.PutUint16(udp[4:], uint16(len(udp)))
+		inner = append(inner, udp...)
+
+		src := net.IP{10, 0, 0, 1}
+		first := bytes.Repeat([]byte{0xaa}, 16)
+		newGREFragment := func(offset uint16, more bool, payload []byte) gopacket.Packet {
+			p := newIPv4Fragment(t, src, 5, offset, more, payload, time.Time{})
+			ip4 := p.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+			ip4.Protocol = layers.IPProtocolGRE
+			buf := gopacket.NewSerializeBuffer()
+			opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+			if err := gopacket.SerializeLayers(buf, opts, p.LinkLayer().(*layers.Ethernet), ip4, gopacket.Payload(payload)); err != nil {
+				t.Fatalf("serialize fragment: %v", err)
+			}
+			return dec.decodeFrame(buf.Bytes())
+		}
+
+		defragger := NewIPDefragmenter()
+		if _, err := defragger.DefragIP(newGREFragment(0, true, first)); err != nil {
+			t.Fatalf("unexpected error on the 1st fragment: %v", err)
+		}
+		pkt, err := defragger.DefragIP(newGREFragment(2, false, inner))
+		if err != nil || pkt == nil {
+			t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+		}
+		ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+		if want := append(append([]byte(nil), first...), inner...); !bytes.Equal(ip4.Payload, want) {
+			t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
+		}
+	})
 }
