@@ -200,7 +200,7 @@ func TestIpDefrag_IPv4IncompleteFlowsAreBounded(t *testing.T) {
 	}
 
 	checkDefragmenter(t, defragger)
-	const limit = 8 << 20
+	const limit = 8 * 1024 * 1024
 	if n := trackedBytes(defragger); n > limit {
 		t.Errorf("defragmenter holds %d bytes of incomplete flows, want at most %d", n, limit)
 	}
@@ -315,5 +315,93 @@ func TestIpDefrag_IPv4FutureTimestampDoesNotStopExpiry(t *testing.T) {
 	checkDefragmenter(t, defragger)
 	if n := len(defragger.ipFlows); n > int(IPFragmentTimeout/time.Second)+2 {
 		t.Errorf("%d flows tracked, want at most the last %v of flows", n, IPFragmentTimeout)
+	}
+}
+
+// DNS-collector decodes captured packets with NetDecoder, which also decodes
+// the UDP header inside a fragment. Reassembly must work for those packets.
+func TestIpDefrag_NetDecoder(t *testing.T) {
+	tests := []struct {
+		name      string
+		fragments func() (gopacket.Packet, gopacket.Packet)
+		length    int
+	}{
+		{name: "IPv4", fragments: dnsQueryIPv4Fragments, length: 113},
+		{name: "IPv6", fragments: dnsQueryIPv6Fragments, length: 137},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frag1, frag2 := tc.fragments()
+			frag1 = gopacket.NewPacket(frag1.Data(), &NetDecoder{}, gopacket.NoCopy)
+			frag2 = gopacket.NewPacket(frag2.Data(), &NetDecoder{}, gopacket.NoCopy)
+
+			defragger := NewIPDefragmenter()
+			if _, err := defragger.DefragIP(frag1); err != nil {
+				t.Fatalf("unexpected error on the 1st fragment: %v", err)
+			}
+			pkt, err := defragger.DefragIP(frag2)
+			if err != nil {
+				t.Fatalf("unexpected error on the 2nd fragment: %v", err)
+			}
+			if pkt == nil {
+				t.Fatal("datagram not reassembled")
+			}
+			if pkt.Metadata().Length != tc.length {
+				t.Errorf("reassembled packet size = %d, want %d", pkt.Metadata().Length, tc.length)
+			}
+		})
+	}
+}
+
+// A fragment that overlaps another one, but is not an exact duplicate, must
+// drop the flow. A later datagram with the same ID must still reassemble.
+func TestIpDefrag_IPv4OverlapDropsFlow(t *testing.T) {
+	src := net.IP{10, 0, 0, 1}
+	defragger := NewIPDefragmenter()
+
+	if _, err := defragger.DefragIP(newIPv4Fragment(t, src, 3, 0, true, make([]byte, 16), time.Time{})); err != nil {
+		t.Fatalf("unexpected error on the 1st fragment: %v", err)
+	}
+	if _, err := defragger.DefragIP(newIPv4Fragment(t, src, 3, 1, true, make([]byte, 16), time.Time{})); err == nil {
+		t.Fatal("no error for an overlapping fragment")
+	}
+	if n := len(defragger.ipFlows); n != 0 {
+		t.Fatalf("%d flows tracked after an overlap, want 0", n)
+	}
+	checkDefragmenter(t, defragger)
+
+	if _, err := defragger.DefragIP(newIPv4Fragment(t, src, 3, 0, true, make([]byte, 16), time.Time{})); err != nil {
+		t.Fatalf("unexpected error on the new 1st fragment: %v", err)
+	}
+	pkt, err := defragger.DefragIP(newIPv4Fragment(t, src, 3, 2, false, make([]byte, 8), time.Time{}))
+	if err != nil || pkt == nil {
+		t.Fatalf("new datagram not reassembled after an overlap: pkt=%v err=%v", pkt, err)
+	}
+}
+
+// Fragments that arrive out of order must reassemble in offset order.
+func TestIpDefrag_IPv4OutOfOrder(t *testing.T) {
+	src := net.IP{10, 0, 0, 1}
+	a := bytes.Repeat([]byte{0xaa}, 8)
+	b := bytes.Repeat([]byte{0xbb}, 8)
+	c := bytes.Repeat([]byte{0xcc}, 8)
+
+	defragger := NewIPDefragmenter()
+	for _, frag := range []gopacket.Packet{
+		newIPv4Fragment(t, src, 4, 1, true, b, time.Time{}),
+		newIPv4Fragment(t, src, 4, 0, true, a, time.Time{}),
+	} {
+		if _, err := defragger.DefragIP(frag); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkDefragmenter(t, defragger)
+	}
+	pkt, err := defragger.DefragIP(newIPv4Fragment(t, src, 4, 2, false, c, time.Time{}))
+	if err != nil || pkt == nil {
+		t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+	}
+	ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if want := bytes.Join([][]byte{a, b, c}, nil); !bytes.Equal(ip4.Payload, want) {
+		t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
 	}
 }

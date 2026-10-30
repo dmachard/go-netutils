@@ -10,8 +10,8 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// checkDefragmenter fails the test if the memory accounting or the lru list
-// no longer match the tracked flows.
+// checkDefragmenter fails the test if the memory accounting, the lru list, or
+// the fragment lists no longer match the tracked flows.
 func checkDefragmenter(t *testing.T, d *IPDefragmenter) {
 	t.Helper()
 	if d.lru.Len() != len(d.ipFlows) {
@@ -24,12 +24,31 @@ func checkDefragmenter(t *testing.T, d *IPDefragmenter) {
 			t.Fatalf("lru flow %v is not in the map", fl.key)
 		}
 		size += fl.size
+		checkFragments(t, fl)
 	}
 	if size != d.size {
 		t.Fatalf("flows hold %d bytes, defragmenter counts %d", size, d.size)
 	}
 	if d.size > d.memoryLimit {
 		t.Fatalf("defragmenter holds %d bytes, limit is %d", d.size, d.memoryLimit)
+	}
+}
+
+// checkFragments fails the test if the fragments of a flow are out of order or
+// overlap, or if Current and Highest don't match them. build relies on this.
+func checkFragments(t *testing.T, fl *fragments) {
+	t.Helper()
+	var end, sum uint16
+	for e := fl.List.Front(); e != nil; e = e.Next() {
+		offset, payload, _ := fragmentInfo(e.Value.(gopacket.Packet))
+		if offset < end {
+			t.Fatalf("flow %v: fragment at %d overlaps or precedes the one that ends at %d", fl.key, offset, end)
+		}
+		end = offset + uint16(len(payload))
+		sum += uint16(len(payload))
+	}
+	if fl.Highest != end || fl.Current != sum {
+		t.Fatalf("flow %v: Highest %d, Current %d, fragments end at %d and hold %d bytes", fl.key, fl.Highest, fl.Current, end, sum)
 	}
 }
 
@@ -47,7 +66,24 @@ func encodeFuzzPackets(steps []int8, pkts ...[]byte) []byte {
 	return out
 }
 
+// fuzzDefragIP decodes each packet with the gopacket layers, as a pcap file
+// reader does, and with NetDecoder, as the DNS-collector sniffer does.
 func fuzzDefragIP(t *testing.T, data []byte, first gopacket.LayerType) {
+	fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
+		return gopacket.NewPacket(raw, first, gopacket.Default)
+	})
+	ethType := layers.EthernetTypeIPv4
+	if first == layers.LayerTypeIPv6 {
+		ethType = layers.EthernetTypeIPv6
+	}
+	fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
+		eth := make([]byte, 14, 14+len(raw))
+		binary.BigEndian.PutUint16(eth[12:], uint16(ethType))
+		return gopacket.NewPacket(append(eth, raw...), &NetDecoder{}, gopacket.NoCopy)
+	})
+}
+
+func fuzzDefragIPWith(t *testing.T, data []byte, first gopacket.LayerType, decode func([]byte) gopacket.Packet) {
 	d := NewIPDefragmenter()
 	// A small limit, so that short inputs reach the eviction path.
 	d.memoryLimit = 4 * fragmentOverhead
@@ -60,8 +96,11 @@ func fuzzDefragIP(t *testing.T, data []byte, first gopacket.LayerType) {
 		if n > len(data) {
 			n = len(data)
 		}
-		pkt := gopacket.NewPacket(data[:n], first, gopacket.Default)
+		pkt := decode(data[:n])
 		data = data[n:]
+		if pkt.NetworkLayer() == nil || pkt.NetworkLayer().LayerType() != first {
+			continue
+		}
 		// DNS-collector only sends packets with a fragment to the defragmenter.
 		if first == layers.LayerTypeIPv4 {
 			ip4, ok := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
