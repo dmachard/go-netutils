@@ -40,7 +40,7 @@ func UDPProcessor(udpInput chan gopacket.Packet, dnsOutput chan DNSPacket, portF
 			TransportLayer: p.TransportFlow(),
 			Timestamp:      packet.Metadata().Timestamp,
 			TCPReassembled: false,
-			IPDefragmented: isReassembled(packet),
+			IPDefragmented: packet.Metadata().Truncated,
 		}
 	}
 }
@@ -61,8 +61,8 @@ func TCPAssembler(tcpInput chan gopacket.Packet, dnsOutput chan DNSPacket, portF
 			p := packet.TransportLayer().(*layers.TCP)
 
 			// ip fragments should not happened with tcp ...
-			if isReassembled(packet) {
-				streamFactory.IPDefragmented = true
+			if packet.Metadata().Truncated {
+				streamFactory.IPDefragmented = packet.Metadata().Truncated
 			}
 
 			// ignore packet ?
