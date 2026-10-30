@@ -50,8 +50,7 @@ func newIPv6Fragment(t testing.TB, id uint32, offset uint16, more bool, payload 
 // checkRoundTrip splits a random datagram into fragments, and sends them to
 // DefragIP in a random order, with duplicates, an optional overlap, and the
 // fragments of other flows that never complete. The reassembled payload must
-// equal the datagram. Without an overlap, it must come out with the last
-// fragment.
+// equal the datagram, and without an overlap it must come out.
 func checkRoundTrip(t *testing.T, dec testDecoder, seed int64, ipv6 bool) {
 	rng := rand.New(rand.NewSource(seed))
 	ts := time.Unix(1700000000, 0)
@@ -79,16 +78,16 @@ func checkRoundTrip(t *testing.T, dec testDecoder, seed int64, ipv6 bool) {
 	if len(pieces) < 2 {
 		return
 	}
-	last := pieces[len(pieces)-1]
-	others := pieces[:len(pieces)-1]
-	rng.Shuffle(len(others), func(i, j int) { others[i], others[j] = others[j], others[i] })
+	end := len(datagram)
+	rng.Shuffle(len(pieces), func(i, j int) { pieces[i], pieces[j] = pieces[j], pieces[i] })
 
 	const id = 1
 	var sends []gopacket.Packet
-	for _, p := range others {
-		sends = append(sends, newFragment(id, p.offset, true, datagram[p.offset:p.end]))
+	for _, p := range pieces {
+		more := p.end != end
+		sends = append(sends, newFragment(id, p.offset, more, datagram[p.offset:p.end]))
 		if rng.Intn(4) == 0 {
-			sends = append(sends, newFragment(id, p.offset, true, datagram[p.offset:p.end]))
+			sends = append(sends, newFragment(id, p.offset, more, datagram[p.offset:p.end]))
 		}
 		if rng.Intn(3) == 0 {
 			// A fragment of another flow that never completes.
@@ -98,44 +97,35 @@ func checkRoundTrip(t *testing.T, dec testDecoder, seed int64, ipv6 bool) {
 	overlap := rng.Intn(4) == 0
 	if overlap {
 		// 8 bytes more than a stored piece, at the same offset.
-		p := others[rng.Intn(len(others))]
+		p := pieces[rng.Intn(len(pieces))]
 		data := append(append([]byte(nil), datagram[p.offset:p.end]...), make([]byte, 8)...)
-		i := len(others) + rng.Intn(len(sends)-len(others)+1)
-		if i > len(sends) {
-			i = len(sends)
-		}
+		i := rng.Intn(len(sends) + 1)
 		sends = append(sends[:i], append([]gopacket.Packet{newFragment(id, p.offset, true, data)}, sends[i:]...)...)
 	}
-	sends = append(sends, newFragment(id, last.offset, false, datagram[last.offset:last.end]))
 
+	// A duplicate after the reassembly starts a new flow, which can complete
+	// again, so each output must equal the datagram.
 	d := NewIPDefragmenter()
-	var out gopacket.Packet
-	for i, frag := range sends {
-		pkt, _ := d.DefragIP(frag)
+	var outputs int
+	for _, frag := range sends {
+		out, _ := d.DefragIP(frag)
 		checkDefragmenter(t, d)
-		if pkt == nil {
+		if out == nil {
 			continue
 		}
-		if i != len(sends)-1 {
-			t.Fatalf("seed %d: datagram reassembled at send %d of %d", seed, i+1, len(sends))
+		outputs++
+		var payload []byte
+		if ipv6 {
+			payload = out.Layer(layers.LayerTypeIPv6).(*layers.IPv6).Payload
+		} else {
+			payload = out.Layer(layers.LayerTypeIPv4).(*layers.IPv4).Payload
 		}
-		out = pkt
-	}
-
-	if out == nil {
-		if !overlap {
-			t.Fatalf("seed %d: datagram of %d bytes in %d fragments not reassembled", seed, len(datagram), len(pieces))
+		if !bytes.Equal(payload, datagram) {
+			t.Fatalf("seed %d: reassembled %d bytes that differ from the %d-byte datagram", seed, len(payload), len(datagram))
 		}
-		return
 	}
-	var payload []byte
-	if ipv6 {
-		payload = out.Layer(layers.LayerTypeIPv6).(*layers.IPv6).Payload
-	} else {
-		payload = out.Layer(layers.LayerTypeIPv4).(*layers.IPv4).Payload
-	}
-	if !bytes.Equal(payload, datagram) {
-		t.Fatalf("seed %d: reassembled %d bytes that differ from the %d-byte datagram", seed, len(payload), len(datagram))
+	if outputs == 0 && !overlap {
+		t.Fatalf("seed %d: datagram of %d bytes in %d fragments not reassembled", seed, len(datagram), len(pieces))
 	}
 }
 
