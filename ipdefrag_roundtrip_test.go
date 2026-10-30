@@ -2,7 +2,6 @@ package netutils
 
 import (
 	"bytes"
-	"encoding/binary"
 	"math/rand"
 	"net"
 	"testing"
@@ -11,41 +10,6 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
-
-// newIPv6Fragment builds one IPv6 fragment. offset is in 8-byte units, as in
-// the fragment header. gopacket can't serialize IPv6Fragment, so the fragment
-// header is written by hand.
-func newIPv6Fragment(t testing.TB, id uint32, offset uint16, more bool, payload []byte, ts time.Time) gopacket.Packet {
-	t.Helper()
-	eth := &layers.Ethernet{
-		SrcMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 1},
-		DstMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 2},
-		EthernetType: layers.EthernetTypeIPv6,
-	}
-	ip6 := &layers.IPv6{
-		Version:    6,
-		NextHeader: layers.IPProtocolIPv6Fragment,
-		HopLimit:   64,
-		SrcIP:      net.ParseIP("fd00::1"),
-		DstIP:      net.ParseIP("fd00::2"),
-	}
-	frag := make([]byte, 8, 8+len(payload))
-	frag[0] = byte(layers.IPProtocolUDP)
-	offsetAndFlags := offset << 3
-	if more {
-		offsetAndFlags |= 1
-	}
-	binary.BigEndian.PutUint16(frag[2:], offsetAndFlags)
-	binary.BigEndian.PutUint32(frag[4:], id)
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true}
-	if err := gopacket.SerializeLayers(buf, opts, eth, ip6, gopacket.Payload(append(frag, payload...))); err != nil {
-		t.Fatalf("serialize fragment: %v", err)
-	}
-	pkt := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
-	pkt.Metadata().Timestamp = ts
-	return pkt
-}
 
 // checkRoundTrip splits a random datagram into fragments, and sends them to
 // DefragIP in a random order, with duplicates, an optional overlap, and the

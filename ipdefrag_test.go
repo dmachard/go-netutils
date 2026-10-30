@@ -63,6 +63,41 @@ func newIPv4Fragment(t testing.TB, src net.IP, id uint16, offset uint16, more bo
 	return pkt
 }
 
+// newIPv6Fragment builds one IPv6 fragment. offset is in 8-byte units, as in
+// the fragment header. gopacket can't serialize IPv6Fragment, so the fragment
+// header is written by hand.
+func newIPv6Fragment(t testing.TB, id uint32, offset uint16, more bool, payload []byte, ts time.Time) gopacket.Packet {
+	t.Helper()
+	eth := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 1},
+		DstMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 2},
+		EthernetType: layers.EthernetTypeIPv6,
+	}
+	ip6 := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolIPv6Fragment,
+		HopLimit:   64,
+		SrcIP:      net.ParseIP("fd00::1"),
+		DstIP:      net.ParseIP("fd00::2"),
+	}
+	frag := make([]byte, 8, 8+len(payload))
+	frag[0] = byte(layers.IPProtocolUDP)
+	offsetAndFlags := offset << 3
+	if more {
+		offsetAndFlags |= 1
+	}
+	binary.BigEndian.PutUint16(frag[2:], offsetAndFlags)
+	binary.BigEndian.PutUint32(frag[4:], id)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip6, gopacket.Payload(append(frag, payload...))); err != nil {
+		t.Fatalf("serialize fragment: %v", err)
+	}
+	pkt := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	pkt.Metadata().Timestamp = ts
+	return pkt
+}
+
 // trackedBytes returns the captured bytes that the defragmenter holds for incomplete flows.
 func trackedBytes(d *IPDefragmenter) int {
 	var n int
@@ -649,33 +684,30 @@ func liveHeap() int64 {
 	return int64(m.HeapAlloc)
 }
 
-// A flow that keeps getting fragments must move to the back of the eviction
-// order, so that a burst of new incomplete flows evicts older ones first.
-func TestIpDefrag_EvictionKeepsActiveFlow(t *testing.T) {
+// A flow must expire IPFragmentTimeout after its first fragment, as in Linux,
+// even if it keeps getting fragments. Else a sender keeps a flow alive with
+// one duplicate per timeout.
+func TestIpDefrag_TimeoutStartsAtFirstFragment(t *testing.T) {
 	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
 		defragger := NewIPDefragmenter()
-		defragger.memoryLimit = 8 * fragmentOverhead
-		active := net.IP{10, 0, 0, 1}
-		noise := func(i int) {
-			_, _ = defragger.DefragIP(dec.newIPv4Fragment(t, net.IP{10, 2, 0, byte(i)}, uint16(i), 185, true, make([]byte, 8), time.Time{}))
+		start := time.Unix(1700000000, 0)
+		src := net.IP{10, 0, 0, 1}
+		frag := func(id uint16, offset uint16, ts time.Time) {
+			if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, id, offset, true, make([]byte, 8), ts)); err != nil {
+				t.Fatal(err)
+			}
+			checkDefragmenter(t, defragger)
 		}
 
-		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 0, true, make([]byte, 8), time.Time{})); err != nil {
-			t.Fatal(err)
+		frag(1, 1, start)
+		frag(1, 1, start.Add(20*time.Second)) // duplicate
+		frag(1, 2, start.Add(25*time.Second)) // new data
+		frag(2, 1, start.Add(IPFragmentTimeout+time.Second))
+		if _, ok := defragger.ipFlows[newIPv4(dec.newIPv4Fragment(t, src, 1, 1, true, make([]byte, 8), start))]; ok {
+			t.Errorf("flow still tracked %v after its first fragment", IPFragmentTimeout+time.Second)
 		}
-		for i := 0; i < 5; i++ {
-			noise(i)
-		}
-		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 1, true, make([]byte, 8), time.Time{})); err != nil {
-			t.Fatal(err)
-		}
-		for i := 5; i < 10; i++ {
-			noise(i)
-		}
-		checkDefragmenter(t, defragger)
-		pkt, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 2, false, make([]byte, 8), time.Time{}))
-		if err != nil || pkt == nil {
-			t.Fatalf("active flow evicted before older flows: pkt=%v err=%v", pkt, err)
+		if n := len(defragger.ipFlows); n != 1 {
+			t.Errorf("%d flows tracked, want 1", n)
 		}
 	})
 }

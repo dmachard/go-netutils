@@ -3,6 +3,7 @@ package netutils
 import (
 	"encoding/binary"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,18 +11,18 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// checkDefragmenter fails the test if the memory accounting, the lru list, or
+// checkDefragmenter fails the test if the memory accounting, the byAge list, or
 // the fragment lists no longer match the tracked flows.
 func checkDefragmenter(t *testing.T, d *IPDefragmenter) {
 	t.Helper()
-	if d.lru.Len() != len(d.ipFlows) {
-		t.Fatalf("lru holds %d flows, map holds %d", d.lru.Len(), len(d.ipFlows))
+	if d.byAge.Len() != len(d.ipFlows) {
+		t.Fatalf("byAge holds %d flows, map holds %d", d.byAge.Len(), len(d.ipFlows))
 	}
 	var size int
-	for e := d.lru.Front(); e != nil; e = e.Next() {
+	for e := d.byAge.Front(); e != nil; e = e.Next() {
 		fl := e.Value.(*fragments)
 		if d.ipFlows[fl.key] != fl {
-			t.Fatalf("lru flow %v is not in the map", fl.key)
+			t.Fatalf("byAge flow %v is not in the map", fl.key)
 		}
 		size += fl.size
 		checkFragments(t, fl)
@@ -187,6 +188,12 @@ func FuzzIPDefragger(f *testing.F) {
 				IPDefragger(ipInput, udpOutput, tcpOutput, 53)
 				close(done)
 			}()
+			// stop also runs if send fails, so that no goroutine leaks.
+			stop := sync.OnceFunc(func() {
+				close(ipInput)
+				<-done
+			})
+			defer stop()
 			send := func(p gopacket.Packet) {
 				select {
 				case ipInput <- p:
@@ -199,8 +206,7 @@ func FuzzIPDefragger(f *testing.F) {
 			}
 			send(dec.decode(frag1))
 			send(dec.decode(frag2))
-			close(ipInput)
-			<-done
+			stop()
 
 			found := false
 			for len(udpOutput) > 0 {
