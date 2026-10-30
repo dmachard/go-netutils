@@ -37,11 +37,9 @@ type fragments struct {
 	Current  uint16
 	LastSeen time.Time
 
-	key    ipFlow
-	size   int           // bytes charged to IPFragmentMemoryLimit
-	elem   *list.Element // position in IPDefragmenter.lru
-	end    uint16        // end of the datagram, from its last fragment
-	hasEnd bool
+	key  ipFlow
+	size int           // bytes charged to IPFragmentMemoryLimit
+	elem *list.Element // position in IPDefragmenter.lru
 }
 
 // fragmentInfo returns the offset in bytes, the payload, and the more
@@ -57,21 +55,12 @@ func fragmentInfo(p gopacket.Packet) (uint16, []byte, bool) {
 }
 
 // insert keeps the fragments sorted by offset. It ignores an exact duplicate
-// and rejects any other overlap, as Linux and RFC 5722 do. It also rejects data
-// past the last fragment. So when Current reaches the end, the fragments cover
-// the datagram with no holes, whatever order they came in.
+// and rejects any other overlap, as Linux and RFC 5722 do. So when Current
+// reaches Highest, the fragments cover the datagram with no holes.
 func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
 	inFragOffset, inPayload, inFragMore := fragmentInfo(in)
 	inFragLength := uint16(len(inPayload))
 	inFragEnd := inFragOffset + inFragLength
-
-	if !inFragMore {
-		if inFragEnd < f.Highest || f.hasEnd && inFragEnd != f.end {
-			return nil, fmt.Errorf("defrag: data past the last fragment")
-		}
-	} else if f.hasEnd && inFragEnd > f.end {
-		return nil, fmt.Errorf("defrag: data past the last fragment")
-	}
 
 	if inFragOffset >= f.Highest {
 		f.List.PushBack(in)
@@ -97,11 +86,9 @@ func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
 		f.Highest = inFragEnd
 	}
 	f.Current += inFragLength
-	if !inFragMore {
-		f.end, f.hasEnd = inFragEnd, true
-	}
 
-	if f.hasEnd && f.Current == f.end {
+	// Final Fragment ?
+	if !inFragMore && f.Highest == f.Current {
 		return f.build(in)
 	}
 	return nil, nil

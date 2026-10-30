@@ -50,9 +50,6 @@ func checkFragments(t *testing.T, fl *fragments) {
 	if fl.Highest != end || fl.Current != sum {
 		t.Fatalf("flow %v: Highest %d, Current %d, fragments end at %d and hold %d bytes", fl.key, fl.Highest, fl.Current, end, sum)
 	}
-	if fl.hasEnd && fl.end != end {
-		t.Fatalf("flow %v: last fragment ends at %d, fragments end at %d", fl.key, fl.end, end)
-	}
 }
 
 // encodeFuzzPackets builds a fuzz input. For each packet it writes a 2-byte
