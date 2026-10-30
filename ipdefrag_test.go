@@ -406,3 +406,32 @@ func TestIpDefrag_IPv4OutOfOrder(t *testing.T) {
 		t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
 	}
 }
+
+// BenchmarkDefragIP reassembles a DNS query of two fragments that NetDecoder
+// decoded, as in the DNS-collector sniffer.
+func BenchmarkDefragIP(b *testing.B) {
+	tests := []struct {
+		name      string
+		fragments func() (gopacket.Packet, gopacket.Packet)
+	}{
+		{name: "IPv4", fragments: dnsQueryIPv4Fragments},
+		{name: "IPv6", fragments: dnsQueryIPv6Fragments},
+	}
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			frag1, frag2 := tc.fragments()
+			frag1 = gopacket.NewPacket(frag1.Data(), &NetDecoder{}, gopacket.NoCopy)
+			frag2 = gopacket.NewPacket(frag2.Data(), &NetDecoder{}, gopacket.NoCopy)
+			defragger := NewIPDefragmenter()
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := defragger.DefragIP(frag1); err != nil {
+					b.Fatal(err)
+				}
+				if pkt, err := defragger.DefragIP(frag2); err != nil || pkt == nil {
+					b.Fatalf("not reassembled: %v", err)
+				}
+			}
+		})
+	}
+}
