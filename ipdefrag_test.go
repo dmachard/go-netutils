@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -525,6 +526,156 @@ func TestIpDefrag_IPv4FragmentWithInnerIPv6Fragment(t *testing.T) {
 		ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
 		if want := append(append([]byte(nil), first...), inner...); !bytes.Equal(ip4.Payload, want) {
 			t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
+		}
+	})
+}
+
+// securityChecks must reject each kind of malformed fragment. Each case here
+// would otherwise be stored, so the error comes only from the check.
+func TestIpDefrag_SecurityChecks(t *testing.T) {
+	src := net.IP{10, 0, 0, 1}
+	truncate := func(p gopacket.Packet, n int) gopacket.Packet {
+		frame := append([]byte(nil), p.Data()[:len(p.Data())-n]...)
+		return gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
+	}
+	tests := []struct {
+		name string
+		frag func(t *testing.T) gopacket.Packet
+	}{
+		{"IPv4 truncated", func(t *testing.T) gopacket.Packet {
+			return truncate(newIPv4Fragment(t, src, 1, 0, true, make([]byte, 24), time.Time{}), 8)
+		}},
+		{"IPv6 truncated", func(t *testing.T) gopacket.Packet {
+			return truncate(newIPv6Fragment(t, 1, 0, true, make([]byte, 24), time.Time{}), 8)
+		}},
+		// 8183*8 + 20 + 80 = 65564, which wraps around to 28 in uint16.
+		{"IPv4 overrun", func(t *testing.T) gopacket.Packet {
+			return newIPv4Fragment(t, src, 1, IPv4MaximumFragmentOffset, false, make([]byte, 80), time.Time{})
+		}},
+		{"IPv6 overrun", func(t *testing.T) gopacket.Packet {
+			return newIPv6Fragment(t, 1, IPv6MaximumFragmentOffset, false, make([]byte, 80), time.Time{})
+		}},
+		{"IPv6 empty", func(t *testing.T) gopacket.Packet {
+			return newIPv6Fragment(t, 1, 0, true, nil, time.Time{})
+		}},
+	}
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				defragger := NewIPDefragmenter()
+				if _, err := defragger.DefragIP(dec.decode(tc.frag(t))); err == nil {
+					t.Error("no error for a malformed fragment")
+				}
+				if n := len(defragger.ipFlows); n != 0 {
+					t.Errorf("%d flows tracked, want 0", n)
+				}
+			})
+		}
+	})
+}
+
+// An empty IPv6 fragment at the offset of a stored fragment must not stop a
+// complete datagram from reassembling.
+func TestIpDefrag_IPv6EmptyFragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		for _, frag := range []gopacket.Packet{
+			newIPv6Fragment(t, 2, 0, true, make([]byte, 16), time.Time{}),
+			newIPv6Fragment(t, 2, 3, true, make([]byte, 8), time.Time{}),
+			newIPv6Fragment(t, 2, 0, true, nil, time.Time{}),
+		} {
+			_, _ = defragger.DefragIP(dec.decode(frag))
+			checkDefragmenter(t, defragger)
+		}
+		pkt, err := defragger.DefragIP(dec.decode(newIPv6Fragment(t, 2, 2, false, make([]byte, 8), time.Time{})))
+		if err != nil || pkt == nil {
+			t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+		}
+	})
+}
+
+// The memory limit must bound the real heap, not only the captured bytes, for
+// small and large fragments of both families, as NetDecoder decodes them.
+func TestIpDefrag_IncompleteFlowsBoundHeap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates hundreds of MB without the limit")
+	}
+	dec := testDecoders[1] // NetDecoder, as the DNS-collector sniffer decodes
+	ts := time.Unix(1700000000, 0)
+	tests := []struct {
+		name    string
+		payload int
+		count   int
+		frag    func(i int, payload []byte) gopacket.Packet
+	}{
+		{"IPv4 small", 8, 100000, func(i int, p []byte) gopacket.Packet {
+			return newIPv4Fragment(t, net.IP{10, 1, byte(i >> 8), byte(i)}, uint16(i), 185, true, p, ts)
+		}},
+		{"IPv4 large", 1400, 20000, func(i int, p []byte) gopacket.Packet {
+			return newIPv4Fragment(t, net.IP{10, 1, byte(i >> 8), byte(i)}, uint16(i), 185, true, p, ts)
+		}},
+		{"IPv6 small", 8, 100000, func(i int, p []byte) gopacket.Packet {
+			return newIPv6Fragment(t, uint32(i), 185, true, p, ts)
+		}},
+		{"IPv6 large", 1400, 20000, func(i int, p []byte) gopacket.Packet {
+			return newIPv6Fragment(t, uint32(i), 185, true, p, ts)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, tc.payload)
+			defragger := NewIPDefragmenter()
+			before := liveHeap()
+			for i := 0; i < tc.count; i++ {
+				_, _ = defragger.DefragIP(dec.decode(tc.frag(i, payload)))
+			}
+			grown := liveHeap() - before
+			runtime.KeepAlive(defragger)
+			t.Logf("heap grew %d KiB, limit %d KiB", grown>>10, IPFragmentMemoryLimit>>10)
+
+			// The accounting is an estimate, so allow 50% over the limit.
+			if limit := int64(IPFragmentMemoryLimit) * 3 / 2; grown > limit {
+				t.Errorf("heap grew %d KiB for %d incomplete flows, want at most %d KiB", grown>>10, tc.count, limit>>10)
+			}
+		})
+	}
+}
+
+// liveHeap returns the heap in use after a full garbage collection.
+func liveHeap() int64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapAlloc)
+}
+
+// A flow that keeps getting fragments must move to the back of the eviction
+// order, so that a burst of new incomplete flows evicts older ones first.
+func TestIpDefrag_EvictionKeepsActiveFlow(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		defragger.memoryLimit = 8 * fragmentOverhead
+		active := net.IP{10, 0, 0, 1}
+		noise := func(i int) {
+			_, _ = defragger.DefragIP(dec.newIPv4Fragment(t, net.IP{10, 2, 0, byte(i)}, uint16(i), 185, true, make([]byte, 8), time.Time{}))
+		}
+
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 0, true, make([]byte, 8), time.Time{})); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 5; i++ {
+			noise(i)
+		}
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 1, true, make([]byte, 8), time.Time{})); err != nil {
+			t.Fatal(err)
+		}
+		for i := 5; i < 10; i++ {
+			noise(i)
+		}
+		checkDefragmenter(t, defragger)
+		pkt, err := defragger.DefragIP(dec.newIPv4Fragment(t, active, 1, 2, false, make([]byte, 8), time.Time{}))
+		if err != nil || pkt == nil {
+			t.Fatalf("active flow evicted before older flows: pkt=%v err=%v", pkt, err)
 		}
 	})
 }

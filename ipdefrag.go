@@ -347,6 +347,12 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 			return fmt.Errorf("fragment truncated (%d < %d)", len(ip6.Payload), ip6.Length)
 		}
 
+		// an empty fragment fits next to any other one, so insert can't keep
+		// the fragments in order. Linux drops it too.
+		if len(frag6.Payload) == 0 {
+			return fmt.Errorf("fragment empty")
+		}
+
 		// don't allow too big fragment offset
 		if frag6.FragmentOffset > IPv6MaximumFragmentOffset {
 			return fmt.Errorf("fragment offset too big (handcrafted? %d > %d)", frag6.FragmentOffset, IPv6MaximumFragmentOffset)
