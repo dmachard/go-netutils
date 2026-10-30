@@ -61,6 +61,8 @@ func TCPAssembler(tcpInput chan gopacket.Packet, dnsOutput chan DNSPacket, portF
 			p := packet.TransportLayer().(*layers.TCP)
 
 			// ip fragments should not happened with tcp ...
+			// TODO: nothing clears this, so after one reassembled packet,
+			// every later stream shows as defragmented.
 			if isReassembled(packet) {
 				streamFactory.IPDefragmented = true
 			}
