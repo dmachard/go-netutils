@@ -116,55 +116,57 @@ func Test_IpDefrag(t *testing.T) {
 func TestIPDefragger_ContinuesAfterRejectedFragment(t *testing.T) {
 	tests := []struct {
 		name string
-		frag func(t *testing.T) gopacket.Packet
+		frag func(t *testing.T, dec testDecoder) gopacket.Packet
 	}{
 		{
 			name: "offset too big",
-			frag: func(t *testing.T) gopacket.Packet {
-				return newIPv4Fragment(t, net.IP{10, 0, 0, 1}, 1, IPv4MaximumFragmentOffset+1, false, make([]byte, 8), time.Time{})
+			frag: func(t *testing.T, dec testDecoder) gopacket.Packet {
+				return dec.newIPv4Fragment(t, net.IP{10, 0, 0, 1}, 1, IPv4MaximumFragmentOffset+1, false, make([]byte, 8), time.Time{})
 			},
 		},
 		{
 			name: "fragment too small",
-			frag: func(t *testing.T) gopacket.Packet {
-				return newIPv4Fragment(t, net.IP{10, 0, 0, 1}, 1, 0, true, make([]byte, 4), time.Time{})
+			frag: func(t *testing.T, dec testDecoder) gopacket.Packet {
+				return dec.newIPv4Fragment(t, net.IP{10, 0, 0, 1}, 1, 0, true, make([]byte, 4), time.Time{})
 			},
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ipInput := make(chan gopacket.Packet)
-			udpOutput := make(chan gopacket.Packet, 1)
-			tcpOutput := make(chan gopacket.Packet, 1)
-			done := make(chan struct{})
-			go func() {
-				IPDefragger(ipInput, udpOutput, tcpOutput, 53)
-				close(done)
-			}()
-			defer func() {
-				close(ipInput)
-				<-done
-			}()
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				ipInput := make(chan gopacket.Packet)
+				udpOutput := make(chan gopacket.Packet, 1)
+				tcpOutput := make(chan gopacket.Packet, 1)
+				done := make(chan struct{})
+				go func() {
+					IPDefragger(ipInput, udpOutput, tcpOutput, 53)
+					close(done)
+				}()
+				defer func() {
+					close(ipInput)
+					<-done
+				}()
 
-			send := func(p gopacket.Packet) {
-				select {
-				case ipInput <- p:
-				case <-time.After(time.Second):
-					t.Fatal("the defragger no longer reads its input")
+				send := func(p gopacket.Packet) {
+					select {
+					case ipInput <- p:
+					case <-time.After(time.Second):
+						t.Fatal("the defragger no longer reads its input")
+					}
 				}
-			}
 
-			send(tc.frag(t))
-			frag1, frag2 := dnsQueryIPv4Fragments()
-			send(frag1)
-			send(frag2)
+				send(tc.frag(t, dec))
+				frag1, frag2 := dec.dnsQueryIPv4Fragments()
+				send(frag1)
+				send(frag2)
 
-			select {
-			case <-udpOutput:
-			case <-time.After(time.Second):
-				t.Fatal("DNS query not reassembled after a rejected fragment")
-			}
-		})
-	}
+				select {
+				case <-udpOutput:
+				case <-time.After(time.Second):
+					t.Fatal("DNS query not reassembled after a rejected fragment")
+				}
+			})
+		}
+	})
 }

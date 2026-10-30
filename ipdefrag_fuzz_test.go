@@ -66,21 +66,19 @@ func encodeFuzzPackets(steps []int8, pkts ...[]byte) []byte {
 	return out
 }
 
-// fuzzDefragIP decodes each packet with the gopacket layers, as a pcap file
-// reader does, and with NetDecoder, as the DNS-collector sniffer does.
+// fuzzDefragIP runs the input once per decoder in testDecoders.
 func fuzzDefragIP(t *testing.T, data []byte, first gopacket.LayerType) {
-	fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
-		return gopacket.NewPacket(raw, first, gopacket.Default)
-	})
 	ethType := layers.EthernetTypeIPv4
 	if first == layers.LayerTypeIPv6 {
 		ethType = layers.EthernetTypeIPv6
 	}
-	fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
-		eth := make([]byte, 14, 14+len(raw))
-		binary.BigEndian.PutUint16(eth[12:], uint16(ethType))
-		return gopacket.NewPacket(append(eth, raw...), &NetDecoder{}, gopacket.NoCopy)
-	})
+	for _, dec := range testDecoders {
+		fuzzDefragIPWith(t, data, first, func(raw []byte) gopacket.Packet {
+			frame := make([]byte, 14, 14+len(raw))
+			binary.BigEndian.PutUint16(frame[12:], uint16(ethType))
+			return dec.decodeFrame(append(frame, raw...))
+		})
+	}
 }
 
 func fuzzDefragIPWith(t *testing.T, data []byte, first gopacket.LayerType, decode func([]byte) gopacket.Packet) {
