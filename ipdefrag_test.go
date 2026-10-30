@@ -29,7 +29,8 @@ func dnsQueryIPv4Fragments() (gopacket.Packet, gopacket.Packet) {
 	return frag1, frag2
 }
 
-// newIPv4Fragment builds one IPv4 UDP fragment. offset is in 8-byte units, as in the IP header.
+// newIPv4Fragment builds one IPv4 UDP fragment. offset is in 8-byte units, as
+// in the IP header. It decodes with NetDecoder, as the DNS-collector sniffer does.
 func newIPv4Fragment(t testing.TB, src net.IP, id uint16, offset uint16, more bool, payload []byte, ts time.Time, options ...layers.IPv4Option) gopacket.Packet {
 	t.Helper()
 	eth := &layers.Ethernet{
@@ -56,7 +57,7 @@ func newIPv4Fragment(t testing.TB, src net.IP, id uint16, offset uint16, more bo
 	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, gopacket.Payload(payload)); err != nil {
 		t.Fatalf("serialize fragment: %v", err)
 	}
-	pkt := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	pkt := gopacket.NewPacket(buf.Bytes(), &NetDecoder{}, gopacket.NoCopy)
 	pkt.Metadata().Timestamp = ts
 	return pkt
 }
@@ -227,7 +228,7 @@ func TestIpDefrag_IPv4MalformedOverlapDoesNotPanic(t *testing.T) {
 	src := net.IP{10, 0, 0, 1}
 	nop := layers.IPv4Option{OptionType: 1, OptionLength: 1}
 	truncated := func(p gopacket.Packet, n int) gopacket.Packet {
-		return gopacket.NewPacket(p.Data()[:len(p.Data())-n], layers.LayerTypeEthernet, gopacket.Default)
+		return gopacket.NewPacket(p.Data()[:len(p.Data())-n], &NetDecoder{}, gopacket.NoCopy)
 	}
 
 	tests := []struct {
