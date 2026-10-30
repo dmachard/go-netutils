@@ -21,7 +21,8 @@ const (
 	IPv4MaximumFragmentOffset  = 8183  // Maximum offset of a fragment
 	IPv4MaximumFragmentListLen = 8192  // Back out if we get more than this many fragments
 
-	// The same defaults as the Linux ipfrag_time and ipfrag_high_thresh sysctls.
+	// The same defaults as the Linux ipfrag_time and ipfrag_high_thresh sysctls:
+	// https://github.com/torvalds/linux/blob/v7.3/net/ipv4/ip_fragment.c#L671-L678
 	// Without them, a flow that never completes stays in memory forever.
 	IPFragmentTimeout     = 30 * time.Second // Drop a flow that got no fragment for this long
 	IPFragmentMemoryLimit = 4 << 20          // Drop the least recently seen flows above this many bytes
