@@ -20,124 +20,95 @@ const (
 	IPv4MaximumSize            = 65535 // Maximum size of a fragment (2^16)
 	IPv4MaximumFragmentOffset  = 8183  // Maximum offset of a fragment
 	IPv4MaximumFragmentListLen = 8192  // Back out if we get more than this many fragments
+
+	// The Linux ipfrag_time and ipfrag_high_thresh defaults:
+	// https://github.com/torvalds/linux/blob/v7.3/net/ipv4/ip_fragment.c#L671-L678
+	// As in Linux, the timeout starts at the first fragment, and later
+	// fragments don't extend it. With fragmentOverhead, the memory limit drops
+	// an IPv4 flow of 8-byte fragments at about 3900 fragments, so it acts
+	// before IPv4MaximumFragmentListLen.
+	IPFragmentTimeout     = 30 * time.Second // Drop a flow this long after its first fragment
+	IPFragmentMemoryLimit = 4 * 1024 * 1024  // Drop the oldest flows above this many bytes
+
+	// fragmentOverhead is the measured heap cost of one stored fragment on top
+	// of its data, so that tiny fragments can't exceed the memory limit.
+	fragmentOverhead = 1024
 )
 
 type fragments struct {
-	List     list.List
-	Highest  uint16
-	Current  uint16
-	LastSeen time.Time
+	List      list.List
+	Highest   uint16
+	Current   uint16
+	FirstSeen time.Time
+
+	key  ipFlow
+	size int           // bytes charged to IPFragmentMemoryLimit
+	elem *list.Element // position in IPDefragmenter.byAge
 }
 
-func (f *fragments) insert(in gopacket.Packet) (gopacket.Packet, error) {
-	var inFragOffset uint16
-	var inFragLength uint16
-	var inFragMore bool
+// fragmentInfo returns the offset in bytes, the payload, and the more
+// fragments flag of a fragment. It checks the network layer first: NetDecoder
+// decodes GRE inside an IPv4 fragment, so the packet can also hold the IPv6
+// fragment header of an inner packet, which securityChecks did not check.
+func fragmentInfo(p gopacket.Packet) (uint16, []byte, bool) {
+	if ip4, ok := p.NetworkLayer().(*layers.IPv4); ok {
+		return ip4.FragOffset * 8, ip4.Payload, ip4.Flags&layers.IPv4MoreFragments > 0
+	}
+	frag6 := p.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
+	return frag6.FragmentOffset * 8, frag6.Payload, frag6.MoreFragments
+}
 
-	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
-		inIP6 := in.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
-		inFrag6 := in.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
-		inFragOffset = inFrag6.FragmentOffset * 8
-		inFragLength = inIP6.Length - 8
-		inFragMore = inFrag6.MoreFragments
-	}
-	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
-		inIP4 := in.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-		inFragOffset = inIP4.FragOffset * 8
-		inFragLength = inIP4.Length - 20
-		inFragMore = inIP4.Flags&layers.IPv4MoreFragments > 0
-	}
+// insert keeps the fragments sorted by offset. It ignores an exact duplicate
+// and rejects any other overlap, as Linux and RFC 5722 do. So when Current
+// reaches Highest, the fragments cover the datagram with no holes. stored
+// tells if in was added to the list.
+func (f *fragments) insert(in gopacket.Packet) (out gopacket.Packet, stored bool, err error) {
+	inFragOffset, inPayload, inFragMore := fragmentInfo(in)
+	inFragLength := uint16(len(inPayload))
+	inFragEnd := inFragOffset + inFragLength
 
 	if inFragOffset >= f.Highest {
 		f.List.PushBack(in)
 	} else {
 		for e := f.List.Front(); e != nil; e = e.Next() {
-			packet, _ := e.Value.(gopacket.Packet)
+			fragOffset, payload, _ := fragmentInfo(e.Value.(gopacket.Packet))
+			fragEnd := fragOffset + uint16(len(payload))
 
-			var fragOffset uint16
-
-			switch packet.NetworkLayer().LayerType() {
-			case layers.LayerTypeIPv6:
-				if frag6Layer := packet.Layer(layers.LayerTypeIPv6Fragment); frag6Layer != nil {
-					frag6 := frag6Layer.(*layers.IPv6Fragment)
-					fragOffset = frag6.FragmentOffset * 8
-				}
-			case layers.LayerTypeIPv4:
-				ip4, _ := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-				fragOffset = ip4.FragOffset * 8
+			if inFragOffset == fragOffset && inFragEnd == fragEnd {
+				return nil, false, nil
 			}
-
-			if inFragOffset == fragOffset {
-				return nil, nil
+			if inFragOffset < fragEnd && fragOffset < inFragEnd {
+				return nil, false, fmt.Errorf("defrag: overlapping fragment")
 			}
-			if inFragOffset <= fragOffset {
+			if inFragOffset < fragOffset {
 				f.List.InsertBefore(in, e)
 				break
 			}
 		}
 	}
 
-	f.LastSeen = in.Metadata().Timestamp
-
-	// After inserting the Fragment, we update the counters
-	if f.Highest < inFragOffset+inFragLength {
-		f.Highest = inFragOffset + inFragLength
+	if f.Highest < inFragEnd {
+		f.Highest = inFragEnd
 	}
 	f.Current += inFragLength
 
 	// Final Fragment ?
 	if !inFragMore && f.Highest == f.Current {
-		return f.build(in)
+		out, err = f.build(in)
+		return out, true, err
 	}
-	return nil, nil
+	return nil, true, nil
 }
 
 func (f *fragments) build(in gopacket.Packet) (gopacket.Packet, error) {
 	var final []byte
-	var currentOffset uint16
 
 	for e := f.List.Front(); e != nil; e = e.Next() {
-		pack, _ := e.Value.(gopacket.Packet)
-
-		var fragOffset uint16
-		var fragLength uint16
-		var fragPayload []byte
-		var ipOffset uint16
-
-		if pack.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
-			frag6 := pack.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
-			ip6 := pack.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
-
-			fragOffset = frag6.FragmentOffset
-			fragLength = ip6.Length
-			fragPayload = frag6.Payload
-			ipOffset = 8
-		}
-		if pack.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
-			ip4 := pack.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-
-			fragOffset = ip4.FragOffset
-			fragLength = ip4.Length
-			fragPayload = ip4.Payload
-			ipOffset = 20
-		}
-
-		offset := fragOffset * 8
-		switch {
-		case offset == currentOffset:
-			final = append(final, fragPayload...)
-			currentOffset = currentOffset + fragLength - ipOffset
-		case offset < currentOffset:
-			startAt := currentOffset - fragOffset*8
-			if startAt > fragLength-ipOffset {
-				return nil, fmt.Errorf("defrag: invalid fragment")
-			}
-			final = append(final, fragPayload[startAt:]...)
-			currentOffset += fragOffset * 8
-		default:
-			// Houston - we have an hole !
+		offset, payload, _ := fragmentInfo(e.Value.(gopacket.Packet))
+		if int(offset) != len(final) {
 			return nil, fmt.Errorf("defrag: hole found")
 		}
+		final = append(final, payload...)
 	}
 
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
@@ -244,14 +215,22 @@ func newIPv6(packet gopacket.Packet) ipFlow {
 type IPDefragmenter struct {
 	sync.RWMutex
 	ipFlows map[ipFlow]*fragments
+	// byAge holds the flows from oldest to newest first fragment.
+	byAge       list.List
+	size        int
+	memoryLimit int
 }
 
 func NewIPDefragmenter() *IPDefragmenter {
 	return &IPDefragmenter{
-		ipFlows: make(map[ipFlow]*fragments),
+		ipFlows:     make(map[ipFlow]*fragments),
+		memoryLimit: IPFragmentMemoryLimit,
 	}
 }
 
+// DefragIP takes the time from in.Metadata().Timestamp to expire flows, so the
+// caller must set it on every packet. With no timestamps, only the memory
+// limit removes incomplete flows.
 func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 	// check if we need to defrag
 	if st := d.dontDefrag(in); st {
@@ -279,31 +258,64 @@ func (d *IPDefragmenter) DefragIP(in gopacket.Packet) (gopacket.Packet, error) {
 		maxFrag = IPv6MaximumFragmentListLen
 	}
 	d.Lock()
+	defer d.Unlock()
+
+	// The capture time, so that a pcap replay expires flows like a live capture.
+	now := in.Metadata().Timestamp
+	d.expire(now)
+
 	fl, exist = d.ipFlows[ipf]
 	if !exist {
-		fl = new(fragments)
+		fl = &fragments{key: ipf, FirstSeen: now}
+		fl.elem = d.byAge.PushBack(fl)
 		d.ipFlows[ipf] = fl
 	}
-	d.Unlock()
 
 	// insert, and if final build it
-	out, err2 := fl.insert(in)
+	out, stored, err2 := fl.insert(in)
+	if stored {
+		// len, not cap: a caller that decodes with NoCopy from a larger
+		// buffer keeps more memory alive than this.
+		cost := len(in.Data()) + fragmentOverhead
+		if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
+			// NetDecoder.decodeIPv6Fragment keeps a second copy of the data.
+			cost += len(in.Data())
+		}
+		fl.size += cost
+		d.size += cost
+	}
 
 	// at last, if we hit the maximum frag list len
 	// without any defrag success, we just drop everything and
 	// raise an error
 	if out == nil && fl.List.Len()+1 > maxFrag {
-		d.flush(ipf)
+		d.remove(fl)
 		return nil, fmt.Errorf("fragment List hits its maximum")
 	}
 
 	// if we got a packet, it's a new one, and he is defragmented
 	// when defrag is done for a flow between two ip clean the list
 	if out != nil {
-		d.flush(ipf)
+		d.remove(fl)
 		return out, nil
 	}
-	return nil, err2
+
+	// a flow with an overlap can never complete
+	if err2 != nil {
+		d.remove(fl)
+		return nil, err2
+	}
+
+	// Drop the oldest flows first. Flows that never complete collect at the
+	// front, and a new flow at the back usually completes in milliseconds.
+	for e := d.byAge.Front(); e != nil && d.size > d.memoryLimit; e = d.byAge.Front() {
+		oldest := e.Value.(*fragments)
+		d.remove(oldest)
+		if oldest == fl {
+			return nil, fmt.Errorf("fragment memory limit reached")
+		}
+	}
+	return nil, nil
 }
 
 func (d *IPDefragmenter) dontDefrag(in gopacket.Packet) bool {
@@ -334,6 +346,20 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv6 {
 		frag6 := in.Layer(layers.LayerTypeIPv6Fragment).(*layers.IPv6Fragment)
 
+		// don't allow a fragment with less data than its header claims. Don't
+		// use Metadata().Truncated: NetDecoder decodes UDP inside fragments,
+		// and that sets it on every first fragment.
+		ip6 := in.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
+		if int(ip6.Length) != len(ip6.Payload) {
+			return fmt.Errorf("fragment truncated (%d < %d)", len(ip6.Payload), ip6.Length)
+		}
+
+		// an empty fragment fits next to any other one, so insert can't keep
+		// the fragments in order. Linux drops it too.
+		if len(frag6.Payload) == 0 {
+			return fmt.Errorf("fragment empty")
+		}
+
 		// don't allow too big fragment offset
 		if frag6.FragmentOffset > IPv6MaximumFragmentOffset {
 			return fmt.Errorf("fragment offset too big (handcrafted? %d > %d)", frag6.FragmentOffset, IPv6MaximumFragmentOffset)
@@ -342,7 +368,7 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 
 		// don't allow fragment that would oversize an IP packet
 		if fragOffset+uint32(len(frag6.Payload)) > IPv6MaximumSize {
-			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+uint32(len(frag6.Payload)), IPv6MaximumFragmentOffset)
+			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+uint32(len(frag6.Payload)), IPv6MaximumSize)
 		}
 	}
 	if in.NetworkLayer().LayerType() == layers.LayerTypeIPv4 {
@@ -358,30 +384,50 @@ func (d *IPDefragmenter) securityChecks(in gopacket.Packet) error {
 		if ip4.FragOffset > IPv4MaximumFragmentOffset {
 			return fmt.Errorf("fragment offset too big (handcrafted? %d > %d)", ip4.FragOffset, IPv4MaximumFragmentOffset)
 		}
-		fragOffset := ip4.FragOffset * 8
+		if int(fragSize) != len(ip4.Payload) {
+			return fmt.Errorf("fragment truncated (%d < %d)", len(ip4.Payload), fragSize)
+		}
 
-		// don't allow fragment that would oversize an IP packet
-		if fragOffset+ip4.Length > IPv4MaximumSize {
-			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+ip4.Length, IPv4MaximumSize)
+		// don't allow fragment that would oversize an IP packet, in uint32 so
+		// that the sum can't wrap around
+		fragOffset := uint32(ip4.FragOffset) * 8
+		if fragOffset+uint32(ip4.Length) > IPv4MaximumSize {
+			return fmt.Errorf("fragment will overrun (handcrafted? %d > %d)", fragOffset+uint32(ip4.Length), IPv4MaximumSize)
 		}
 	}
 
 	return nil
 }
 
-func (d *IPDefragmenter) flush(ipf ipFlow) {
-	d.Lock()
-	delete(d.ipFlows, ipf)
-	d.Unlock()
+// remove must be called with the lock held.
+func (d *IPDefragmenter) remove(fl *fragments) {
+	delete(d.ipFlows, fl.key)
+	d.byAge.Remove(fl.elem)
+	d.size -= fl.size
+}
+
+// expire removes the flows that started more than IPFragmentTimeout before or
+// after now. It must be called with the lock held. It stops at the first
+// recent flow in byAge. A flow after now comes from a clock step back, and it
+// would otherwise block expiry until the clock caught up.
+func (d *IPDefragmenter) expire(now time.Time) {
+	for e := d.byAge.Front(); e != nil; e = d.byAge.Front() {
+		fl := e.Value.(*fragments)
+		age := now.Sub(fl.FirstSeen)
+		if age <= IPFragmentTimeout && age >= -IPFragmentTimeout {
+			return
+		}
+		d.remove(fl)
+	}
 }
 
 func (d *IPDefragmenter) DiscardOlderThan(t time.Time) int {
 	var nb int
 	d.Lock()
-	for k, v := range d.ipFlows {
-		if v.LastSeen.Before(t) {
+	for _, fl := range d.ipFlows {
+		if fl.FirstSeen.Before(t) {
 			nb++
-			delete(d.ipFlows, k)
+			d.remove(fl)
 		}
 	}
 	d.Unlock()

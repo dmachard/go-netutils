@@ -1,14 +1,20 @@
 package netutils
 
 import (
+	"bytes"
+	"encoding/binary"
+	"net"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
 
-func TestIpDefrag_IPv4Fragment(t *testing.T) {
-	// fragmented packet, see the packet in testsdata/pcap/dnsdump_ip4_fragmented_query.pcap
+// dnsQueryIPv4Fragments returns the two fragments of a DNS query to port 53,
+// see the packet in testsdata/pcap/dnsdump_ip4_fragmented_query.pcap
+func dnsQueryIPv4Fragments() (gopacket.Packet, gopacket.Packet) {
 	frag1Bytes := []byte{0x58, 0x1d, 0xd8, 0x12, 0x84, 0x10, 0xb0, 0x35, 0x9f, 0xd4, 0x03, 0x91, 0x08, 0x00,
 		0x45, 0x00, 0x00, 0x4c, 0x00, 0x01, 0x20, 0x00, 0x40, 0x11, 0xcb, 0x8f, 0x7f, 0x00, 0x00, 0x01,
 		0x08, 0x08, 0x08, 0x08, 0x30, 0x39, 0x00, 0x35, 0x00, 0x5d, 0xf9, 0x10, 0xaa, 0xaa, 0x01, 0x00,
@@ -22,51 +28,191 @@ func TestIpDefrag_IPv4Fragment(t *testing.T) {
 		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x03, 0x63, 0x6f, 0x6d,
 		0x00, 0x00, 0x01, 0x00, 0x01}
 	frag2 := gopacket.NewPacket(frag2Bytes, layers.LayerTypeEthernet, gopacket.Default)
+	return frag1, frag2
+}
 
-	defragger := NewIPDefragmenter()
-	_, err := defragger.DefragIP(frag1)
-	if err != nil {
-		t.Errorf("Unexpected error on the 1er defrag: %v", err)
+// newIPv4Fragment builds one IPv4 UDP fragment. offset is in 8-byte units, as in the IP header.
+func newIPv4Fragment(t testing.TB, src net.IP, id uint16, offset uint16, more bool, payload []byte, ts time.Time, options ...layers.IPv4Option) gopacket.Packet {
+	t.Helper()
+	eth := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 1},
+		DstMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 2},
+		EthernetType: layers.EthernetTypeIPv4,
 	}
+	ip4 := &layers.IPv4{
+		Version:    4,
+		IHL:        5,
+		TTL:        64,
+		Id:         id,
+		FragOffset: offset,
+		Protocol:   layers.IPProtocolUDP,
+		SrcIP:      src,
+		DstIP:      net.IP{10, 0, 0, 2},
+		Options:    options,
+	}
+	if more {
+		ip4.Flags = layers.IPv4MoreFragments
+	}
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip4, gopacket.Payload(payload)); err != nil {
+		t.Fatalf("serialize fragment: %v", err)
+	}
+	pkt := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	pkt.Metadata().Timestamp = ts
+	return pkt
+}
 
-	pkt, err := defragger.DefragIP(frag2)
-	if err != nil {
-		t.Errorf("Unexpected error on the 2nd defrag: %v", err)
+// newIPv6Fragment builds one IPv6 fragment. offset is in 8-byte units, as in
+// the fragment header. gopacket can't serialize IPv6Fragment, so the fragment
+// header is written by hand.
+func newIPv6Fragment(t testing.TB, id uint32, offset uint16, more bool, payload []byte, ts time.Time) gopacket.Packet {
+	t.Helper()
+	eth := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 1},
+		DstMAC:       net.HardwareAddr{0x02, 0, 0, 0, 0, 2},
+		EthernetType: layers.EthernetTypeIPv6,
 	}
+	ip6 := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolIPv6Fragment,
+		HopLimit:   64,
+		SrcIP:      net.ParseIP("fd00::1"),
+		DstIP:      net.ParseIP("fd00::2"),
+	}
+	frag := make([]byte, 8, 8+len(payload))
+	frag[0] = byte(layers.IPProtocolUDP)
+	offsetAndFlags := offset << 3
+	if more {
+		offsetAndFlags |= 1
+	}
+	binary.BigEndian.PutUint16(frag[2:], offsetAndFlags)
+	binary.BigEndian.PutUint32(frag[4:], id)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true}
+	if err := gopacket.SerializeLayers(buf, opts, eth, ip6, gopacket.Payload(append(frag, payload...))); err != nil {
+		t.Fatalf("serialize fragment: %v", err)
+	}
+	pkt := gopacket.NewPacket(buf.Bytes(), layers.LayerTypeEthernet, gopacket.Default)
+	pkt.Metadata().Timestamp = ts
+	return pkt
+}
 
-	if pkt.Metadata().Length != 113 {
-		t.Errorf("Invalid reassembled packet size: %v", err)
+// trackedBytes returns the captured bytes that the defragmenter holds for incomplete flows.
+func trackedBytes(d *IPDefragmenter) int {
+	var n int
+	for _, fl := range d.ipFlows {
+		for e := fl.List.Front(); e != nil; e = e.Next() {
+			n += len(e.Value.(gopacket.Packet).Data())
+		}
 	}
+	return n
+}
+
+// testDecoder is one of the decoders that callers decode packets with before
+// they call DefragIP. Each defrag test runs once per decoder, because the
+// decoders build different layers for the same fragment.
+type testDecoder struct {
+	name        string
+	decodeFrame func(frame []byte) gopacket.Packet // frame starts with an Ethernet header
+}
+
+var testDecoders = []testDecoder{
+	// gopacket layers, as the pcap file reader decodes.
+	{"gopacket", func(frame []byte) gopacket.Packet {
+		return gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
+	}},
+	// NetDecoder and RawIPDecoder, as the DNS-collector sniffer decodes. They
+	// also decode the UDP header inside a fragment.
+	{"NetDecoder", func(frame []byte) gopacket.Packet {
+		return gopacket.NewPacket(frame, &NetDecoder{}, gopacket.NoCopy)
+	}},
+	{"RawIPDecoder", func(frame []byte) gopacket.Packet {
+		return gopacket.NewPacket(frame[14:], &RawIPDecoder{}, gopacket.NoCopy)
+	}},
+}
+
+// decode decodes the Ethernet frame of p again, and keeps its capture time.
+func (d testDecoder) decode(p gopacket.Packet) gopacket.Packet {
+	out := d.decodeFrame(p.Data())
+	out.Metadata().Timestamp = p.Metadata().Timestamp
+	return out
+}
+
+func (d testDecoder) newIPv4Fragment(t testing.TB, src net.IP, id uint16, offset uint16, more bool, payload []byte, ts time.Time, options ...layers.IPv4Option) gopacket.Packet {
+	t.Helper()
+	return d.decode(newIPv4Fragment(t, src, id, offset, more, payload, ts, options...))
+}
+
+func (d testDecoder) dnsQueryIPv4Fragments() (gopacket.Packet, gopacket.Packet) {
+	frag1, frag2 := dnsQueryIPv4Fragments()
+	return d.decode(frag1), d.decode(frag2)
+}
+
+func (d testDecoder) dnsQueryIPv6Fragments() (gopacket.Packet, gopacket.Packet) {
+	frag1, frag2 := dnsQueryIPv6Fragments()
+	return d.decode(frag1), d.decode(frag2)
+}
+
+// forEachDecoder runs fn as a subtest once per decoder.
+func forEachDecoder(t *testing.T, fn func(t *testing.T, dec testDecoder)) {
+	t.Helper()
+	for _, dec := range testDecoders {
+		t.Run(dec.name, func(t *testing.T) { fn(t, dec) })
+	}
+}
+
+func TestIpDefrag_IPv4Fragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		frag1, frag2 := dec.dnsQueryIPv4Fragments()
+
+		defragger := NewIPDefragmenter()
+		_, err := defragger.DefragIP(frag1)
+		if err != nil {
+			t.Errorf("Unexpected error on the 1er defrag: %v", err)
+		}
+
+		pkt, err := defragger.DefragIP(frag2)
+		if err != nil {
+			t.Errorf("Unexpected error on the 2nd defrag: %v", err)
+		}
+
+		if pkt.Metadata().Length != 113 {
+			t.Errorf("Invalid reassembled packet size: %v", err)
+		}
+	})
 }
 
 func TestIpDefrag_IPv4FragmentWithRetransmission(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
 
-	// fragmented packet, see the packet in testsdata/pcap/dnsdump_ip4_fragmented_query.pcap
-	packetBytes := []byte{
-		0x58, 0x1d, 0xd8, 0x12, 0x84, 0x10, 0xb0, 0x35, 0x9f, 0xd4, 0x03, 0x91, 0x08, 0x00, 0x45, 0x00,
-		0x00, 0x39, 0x00, 0x01, 0x00, 0x07, 0x40, 0x11, 0xeb, 0x9b, 0x7f, 0x00, 0x00, 0x01, 0x08, 0x08,
-		0x08, 0x08, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
-		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x03, 0x63,
-		0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
-	}
-	packet := gopacket.NewPacket(packetBytes, layers.LayerTypeEthernet, gopacket.Default)
+		// fragmented packet, see the packet in testsdata/pcap/dnsdump_ip4_fragmented_query.pcap
+		packetBytes := []byte{
+			0x58, 0x1d, 0xd8, 0x12, 0x84, 0x10, 0xb0, 0x35, 0x9f, 0xd4, 0x03, 0x91, 0x08, 0x00, 0x45, 0x00,
+			0x00, 0x39, 0x00, 0x01, 0x00, 0x07, 0x40, 0x11, 0xeb, 0x9b, 0x7f, 0x00, 0x00, 0x01, 0x08, 0x08,
+			0x08, 0x08, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+			0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x03, 0x63,
+			0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
+		}
+		packet := dec.decodeFrame(packetBytes)
 
-	// This packet is just a fragment
-	defragger := NewIPDefragmenter()
-	_, err := defragger.DefragIP(packet)
-	if err != nil {
-		t.Errorf("Unexpected error on the 1er defrag: %v", err)
-	}
+		// This packet is just a fragment
+		defragger := NewIPDefragmenter()
+		_, err := defragger.DefragIP(packet)
+		if err != nil {
+			t.Errorf("Unexpected error on the 1er defrag: %v", err)
+		}
 
-	// Try to defrag the same packet
-	_, err = defragger.DefragIP(packet)
-	if err != nil {
-		t.Errorf("Unexpected error for the 2nd defrag: %v", err)
-	}
+		// Try to defrag the same packet
+		_, err = defragger.DefragIP(packet)
+		if err != nil {
+			t.Errorf("Unexpected error for the 2nd defrag: %v", err)
+		}
+	})
 }
 
-func TestIpDefrag_IPv6Fragment(t *testing.T) {
-	// fragmented packet, see the packet in testsdata/pcap/dnsdump_ip4_fragmented_query.pcap
+// dnsQueryIPv6Fragments returns the two fragments of a DNS query to port 53 over IPv6.
+func dnsQueryIPv6Fragments() (gopacket.Packet, gopacket.Packet) {
 	frag1Bytes := []byte{0x33, 0x33, 0x00, 0x00, 0x00, 0x01, 0xb0, 0x35, 0x9f, 0xd4, 0x03, 0x91, 0x86, 0xdd, 0x60, 0x00,
 		0x00, 0x00, 0x00, 0x38, 0x2c, 0x40, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5b, 0x20,
 		0xbf, 0xa1, 0x87, 0x8c, 0x3a, 0x68, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -84,18 +230,484 @@ func TestIpDefrag_IPv6Fragment(t *testing.T) {
 		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x00, 0x00, 0x01, 0x00, 0x01}
 	frag2 := gopacket.NewPacket(frag2Bytes, layers.LayerTypeEthernet, gopacket.Default)
 
-	defragger := NewIPDefragmenter()
-	_, err := defragger.DefragIP(frag1)
-	if err != nil {
-		t.Errorf("Unexpected error on the 1er defrag: %v", err)
-	}
+	return frag1, frag2
+}
 
-	pkt, err := defragger.DefragIP(frag2)
-	if err != nil {
-		t.Errorf("Unexpected error on the 2nd defrag: %v", err)
-	}
+func TestIpDefrag_IPv6Fragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		frag1, frag2 := dec.dnsQueryIPv6Fragments()
 
-	if pkt.Metadata().Length != 137 {
-		t.Errorf("Invalid reassembled packet size: %v", err)
+		defragger := NewIPDefragmenter()
+		_, err := defragger.DefragIP(frag1)
+		if err != nil {
+			t.Errorf("Unexpected error on the 1er defrag: %v", err)
+		}
+
+		pkt, err := defragger.DefragIP(frag2)
+		if err != nil {
+			t.Errorf("Unexpected error on the 2nd defrag: %v", err)
+		}
+
+		if pkt.Metadata().Length != 137 {
+			t.Errorf("Invalid reassembled packet size: %v", err)
+		}
+	})
+}
+
+// A fragment whose flow never completes must not stay in memory forever. The
+// sniffer BPF filter accepts every non-first fragment but drops the first
+// fragment of a non-DNS datagram, so these flows are common in live capture.
+func TestIpDefrag_IPv4IncompleteFlowsExpire(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		start := time.Unix(1700000000, 0)
+		src := net.IP{10, 0, 0, 1}
+
+		for id := 0; id < 1000; id++ {
+			frag := dec.newIPv4Fragment(t, src, uint16(id), 185, false, make([]byte, 100), start)
+			if _, err := defragger.DefragIP(frag); err != nil {
+				t.Fatalf("unexpected error for fragment %d: %v", id, err)
+			}
+		}
+
+		later := dec.newIPv4Fragment(t, src, 5000, 185, false, make([]byte, 100), start.Add(10*time.Minute))
+		if _, err := defragger.DefragIP(later); err != nil {
+			t.Fatalf("unexpected error for the later fragment: %v", err)
+		}
+
+		if n := len(defragger.ipFlows); n > 1 {
+			t.Errorf("%d incomplete flows still tracked 10 minutes later, want at most 1", n)
+		}
+	})
+}
+
+// A burst of incomplete flows inside the timeout must not grow memory without
+// limit, and the burst must not block the reassembly of new DNS flows.
+func TestIpDefrag_IPv4IncompleteFlowsAreBounded(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		ts := time.Unix(1700000000, 0)
+		payload := make([]byte, 1400)
+
+		// 20000 flows of about 1.4 KB each is about 28 MB of captured data.
+		for i := 0; i < 20000; i++ {
+			src := net.IP{10, 1, byte(i >> 8), byte(i)}
+			frag := dec.newIPv4Fragment(t, src, uint16(i), 185, true, payload, ts)
+			if _, err := defragger.DefragIP(frag); err != nil {
+				t.Fatalf("unexpected error for fragment %d: %v", i, err)
+			}
+		}
+
+		checkDefragmenter(t, defragger)
+		const limit = 8 * 1024 * 1024
+		if n := trackedBytes(defragger); n > limit {
+			t.Errorf("defragmenter holds %d bytes of incomplete flows, want at most %d", n, limit)
+		}
+
+		frag1, frag2 := dec.dnsQueryIPv4Fragments()
+		frag1.Metadata().Timestamp = ts
+		frag2.Metadata().Timestamp = ts
+		if _, err := defragger.DefragIP(frag1); err != nil {
+			t.Fatalf("unexpected error on the 1st DNS fragment: %v", err)
+		}
+		pkt, err := defragger.DefragIP(frag2)
+		if err != nil {
+			t.Fatalf("unexpected error on the 2nd DNS fragment: %v", err)
+		}
+		if pkt == nil {
+			t.Fatal("DNS query not reassembled after a burst of incomplete flows")
+		}
+	})
+}
+
+// Overlapping fragments with IP options or a truncated capture must be
+// rejected, not panic. A panic in the defragger goroutine stops the whole
+// process.
+func TestIpDefrag_IPv4MalformedOverlapDoesNotPanic(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		src := net.IP{10, 0, 0, 1}
+		nop := layers.IPv4Option{OptionType: 1, OptionLength: 1}
+		truncated := func(p gopacket.Packet, n int) gopacket.Packet {
+			return dec.decodeFrame(p.Data()[:len(p.Data())-n])
+		}
+
+		tests := []struct {
+			name  string
+			frags []gopacket.Packet
+		}{
+			{
+				name: "IP options on an overlapping fragment",
+				frags: []gopacket.Packet{
+					dec.newIPv4Fragment(t, src, 7, 0, true, make([]byte, 236), time.Time{}),
+					dec.newIPv4Fragment(t, src, 7, 55, true, make([]byte, 64), time.Time{}),
+					dec.newIPv4Fragment(t, src, 7, 4, false, make([]byte, 200), time.Time{}, nop, nop, nop, nop),
+				},
+			},
+			{
+				name: "truncated overlapping fragment",
+				frags: []gopacket.Packet{
+					dec.newIPv4Fragment(t, src, 8, 0, true, make([]byte, 16), time.Time{}),
+					dec.newIPv4Fragment(t, src, 8, 5, true, make([]byte, 8), time.Time{}),
+					truncated(newIPv4Fragment(t, src, 8, 1, false, make([]byte, 24), time.Time{}), 21),
+				},
+			},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("DefragIP panicked: %v", r)
+					}
+				}()
+				defragger := NewIPDefragmenter()
+				for _, frag := range tc.frags {
+					_, _ = defragger.DefragIP(frag)
+				}
+			})
+		}
+	})
+}
+
+// The fragment lengths must come from the header length in IHL, not from a
+// fixed 20 bytes, or a datagram with IP options reassembles wrong.
+func TestIpDefrag_IPv4FragmentsWithOptions(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		src := net.IP{10, 0, 0, 1}
+		nop := layers.IPv4Option{OptionType: 1, OptionLength: 1}
+		first := bytes.Repeat([]byte{0xaa}, 16)
+		last := bytes.Repeat([]byte{0xbb}, 8)
+
+		defragger := NewIPDefragmenter()
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 9, 0, true, first, time.Time{}, nop, nop, nop, nop)); err != nil {
+			t.Fatalf("unexpected error on the 1st fragment: %v", err)
+		}
+		pkt, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 9, 2, false, last, time.Time{}, nop, nop, nop, nop))
+		if err != nil {
+			t.Fatalf("unexpected error on the 2nd fragment: %v", err)
+		}
+		if pkt == nil {
+			t.Fatal("datagram with IP options not reassembled")
+		}
+		ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+		if want := append(append([]byte(nil), first...), last...); !bytes.Equal(ip4.Payload, want) {
+			t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
+		}
+	})
+}
+
+// One fragment with a far-future capture time must not stop the expiry of the
+// flows that come after it.
+func TestIpDefrag_IPv4FutureTimestampDoesNotStopExpiry(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		start := time.Unix(1700000000, 0)
+		src := net.IP{10, 0, 0, 1}
+
+		future := dec.newIPv4Fragment(t, src, 1, 185, true, make([]byte, 100), start.Add(100*365*24*time.Hour))
+		if _, err := defragger.DefragIP(future); err != nil {
+			t.Fatalf("unexpected error for the future fragment: %v", err)
+		}
+
+		// One fragment per second for 1000 seconds, each in its own flow.
+		for i := 0; i < 1000; i++ {
+			frag := dec.newIPv4Fragment(t, src, uint16(i+2), 185, true, make([]byte, 100), start.Add(time.Duration(i)*time.Second))
+			if _, err := defragger.DefragIP(frag); err != nil {
+				t.Fatalf("unexpected error for fragment %d: %v", i, err)
+			}
+		}
+
+		checkDefragmenter(t, defragger)
+		if n := len(defragger.ipFlows); n > int(IPFragmentTimeout/time.Second)+2 {
+			t.Errorf("%d flows tracked, want at most the last %v of flows", n, IPFragmentTimeout)
+		}
+	})
+}
+
+// A fragment that overlaps another one, but is not an exact duplicate, must
+// drop the flow. A later datagram with the same ID must still reassemble.
+func TestIpDefrag_IPv4OverlapDropsFlow(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		src := net.IP{10, 0, 0, 1}
+		defragger := NewIPDefragmenter()
+
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 3, 0, true, make([]byte, 16), time.Time{})); err != nil {
+			t.Fatalf("unexpected error on the 1st fragment: %v", err)
+		}
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 3, 1, true, make([]byte, 16), time.Time{})); err == nil {
+			t.Fatal("no error for an overlapping fragment")
+		}
+		if n := len(defragger.ipFlows); n != 0 {
+			t.Fatalf("%d flows tracked after an overlap, want 0", n)
+		}
+		checkDefragmenter(t, defragger)
+
+		if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 3, 0, true, make([]byte, 16), time.Time{})); err != nil {
+			t.Fatalf("unexpected error on the new 1st fragment: %v", err)
+		}
+		pkt, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 3, 2, false, make([]byte, 8), time.Time{}))
+		if err != nil || pkt == nil {
+			t.Fatalf("new datagram not reassembled after an overlap: pkt=%v err=%v", pkt, err)
+		}
+	})
+}
+
+// Fragments that arrive out of order must reassemble in offset order.
+func TestIpDefrag_IPv4OutOfOrder(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		src := net.IP{10, 0, 0, 1}
+		a := bytes.Repeat([]byte{0xaa}, 8)
+		b := bytes.Repeat([]byte{0xbb}, 8)
+		c := bytes.Repeat([]byte{0xcc}, 8)
+
+		defragger := NewIPDefragmenter()
+		for _, frag := range []gopacket.Packet{
+			dec.newIPv4Fragment(t, src, 4, 1, true, b, time.Time{}),
+			dec.newIPv4Fragment(t, src, 4, 0, true, a, time.Time{}),
+		} {
+			if _, err := defragger.DefragIP(frag); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			checkDefragmenter(t, defragger)
+		}
+		pkt, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, 4, 2, false, c, time.Time{}))
+		if err != nil || pkt == nil {
+			t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+		}
+		ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+		if want := bytes.Join([][]byte{a, b, c}, nil); !bytes.Equal(ip4.Payload, want) {
+			t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
+		}
+	})
+}
+
+// BenchmarkDefragIP reassembles a DNS query of two fragments that NetDecoder
+// decoded, as in the DNS-collector sniffer.
+func BenchmarkDefragIP(b *testing.B) {
+	tests := []struct {
+		name      string
+		fragments func() (gopacket.Packet, gopacket.Packet)
+	}{
+		{name: "IPv4", fragments: dnsQueryIPv4Fragments},
+		{name: "IPv6", fragments: dnsQueryIPv6Fragments},
 	}
+	for _, tc := range tests {
+		b.Run(tc.name, func(b *testing.B) {
+			frag1, frag2 := tc.fragments()
+			frag1 = gopacket.NewPacket(frag1.Data(), &NetDecoder{}, gopacket.NoCopy)
+			frag2 = gopacket.NewPacket(frag2.Data(), &NetDecoder{}, gopacket.NoCopy)
+			defragger := NewIPDefragmenter()
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := defragger.DefragIP(frag1); err != nil {
+					b.Fatal(err)
+				}
+				if pkt, err := defragger.DefragIP(frag2); err != nil || pkt == nil {
+					b.Fatalf("not reassembled: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// NetDecoder decodes GRE inside any IPv4 fragment, so a fragment can also hold
+// the IPv6 fragment header of an inner packet. The defragmenter must use the
+// IPv4 header, or a sender controls the offset and length of the fragment.
+func TestIpDefrag_IPv4FragmentWithInnerIPv6Fragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		// GRE, then an IPv6 header, a fragment header at the highest offset,
+		// and a UDP header.
+		inner := []byte{0x00, 0x00, 0x86, 0xdd}
+		ip6 := make([]byte, 40)
+		ip6[0] = 0x60
+		binary.BigEndian.PutUint16(ip6[4:], 8+8+24)
+		ip6[6] = byte(layers.IPProtocolIPv6Fragment)
+		ip6[7] = 64
+		copy(ip6[8:], net.ParseIP("fd00::1"))
+		copy(ip6[24:], net.ParseIP("fd00::2"))
+		inner = append(inner, ip6...)
+		frag6 := make([]byte, 8)
+		frag6[0] = byte(layers.IPProtocolUDP)
+		binary.BigEndian.PutUint16(frag6[2:], IPv6MaximumFragmentOffset<<3)
+		inner = append(inner, frag6...)
+		udp := make([]byte, 8+24)
+		binary.BigEndian.PutUint16(udp[0:], 1234)
+		binary.BigEndian.PutUint16(udp[2:], 53)
+		binary.BigEndian.PutUint16(udp[4:], uint16(len(udp)))
+		inner = append(inner, udp...)
+
+		src := net.IP{10, 0, 0, 1}
+		first := bytes.Repeat([]byte{0xaa}, 16)
+		newGREFragment := func(offset uint16, more bool, payload []byte) gopacket.Packet {
+			p := newIPv4Fragment(t, src, 5, offset, more, payload, time.Time{})
+			ip4 := p.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+			ip4.Protocol = layers.IPProtocolGRE
+			buf := gopacket.NewSerializeBuffer()
+			opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+			if err := gopacket.SerializeLayers(buf, opts, p.LinkLayer().(*layers.Ethernet), ip4, gopacket.Payload(payload)); err != nil {
+				t.Fatalf("serialize fragment: %v", err)
+			}
+			return dec.decodeFrame(buf.Bytes())
+		}
+
+		defragger := NewIPDefragmenter()
+		if _, err := defragger.DefragIP(newGREFragment(0, true, first)); err != nil {
+			t.Fatalf("unexpected error on the 1st fragment: %v", err)
+		}
+		pkt, err := defragger.DefragIP(newGREFragment(2, false, inner))
+		if err != nil || pkt == nil {
+			t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+		}
+		ip4 := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+		if want := append(append([]byte(nil), first...), inner...); !bytes.Equal(ip4.Payload, want) {
+			t.Errorf("reassembled payload = %x, want %x", ip4.Payload, want)
+		}
+	})
+}
+
+// securityChecks must reject each kind of malformed fragment. Each case here
+// would otherwise be stored, so the error comes only from the check.
+func TestIpDefrag_SecurityChecks(t *testing.T) {
+	src := net.IP{10, 0, 0, 1}
+	truncate := func(p gopacket.Packet, n int) gopacket.Packet {
+		frame := append([]byte(nil), p.Data()[:len(p.Data())-n]...)
+		return gopacket.NewPacket(frame, layers.LayerTypeEthernet, gopacket.Default)
+	}
+	tests := []struct {
+		name string
+		frag func(t *testing.T) gopacket.Packet
+	}{
+		{"IPv4 truncated", func(t *testing.T) gopacket.Packet {
+			return truncate(newIPv4Fragment(t, src, 1, 0, true, make([]byte, 24), time.Time{}), 8)
+		}},
+		{"IPv6 truncated", func(t *testing.T) gopacket.Packet {
+			return truncate(newIPv6Fragment(t, 1, 0, true, make([]byte, 24), time.Time{}), 8)
+		}},
+		// 8183*8 + 20 + 80 = 65564, which wraps around to 28 in uint16.
+		{"IPv4 overrun", func(t *testing.T) gopacket.Packet {
+			return newIPv4Fragment(t, src, 1, IPv4MaximumFragmentOffset, false, make([]byte, 80), time.Time{})
+		}},
+		{"IPv6 overrun", func(t *testing.T) gopacket.Packet {
+			return newIPv6Fragment(t, 1, IPv6MaximumFragmentOffset, false, make([]byte, 80), time.Time{})
+		}},
+		{"IPv6 empty", func(t *testing.T) gopacket.Packet {
+			return newIPv6Fragment(t, 1, 0, true, nil, time.Time{})
+		}},
+	}
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				defragger := NewIPDefragmenter()
+				if _, err := defragger.DefragIP(dec.decode(tc.frag(t))); err == nil {
+					t.Error("no error for a malformed fragment")
+				}
+				if n := len(defragger.ipFlows); n != 0 {
+					t.Errorf("%d flows tracked, want 0", n)
+				}
+			})
+		}
+	})
+}
+
+// An empty IPv6 fragment at the offset of a stored fragment must not stop a
+// complete datagram from reassembling.
+func TestIpDefrag_IPv6EmptyFragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		for _, frag := range []gopacket.Packet{
+			newIPv6Fragment(t, 2, 0, true, make([]byte, 16), time.Time{}),
+			newIPv6Fragment(t, 2, 3, true, make([]byte, 8), time.Time{}),
+			newIPv6Fragment(t, 2, 0, true, nil, time.Time{}),
+		} {
+			_, _ = defragger.DefragIP(dec.decode(frag))
+			checkDefragmenter(t, defragger)
+		}
+		pkt, err := defragger.DefragIP(dec.decode(newIPv6Fragment(t, 2, 2, false, make([]byte, 8), time.Time{})))
+		if err != nil || pkt == nil {
+			t.Fatalf("datagram not reassembled: pkt=%v err=%v", pkt, err)
+		}
+	})
+}
+
+// The memory limit must bound the real heap, not only the captured bytes, for
+// small and large fragments of both families, as NetDecoder decodes them.
+func TestIpDefrag_IncompleteFlowsBoundHeap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates hundreds of MB without the limit")
+	}
+	dec := testDecoders[1] // NetDecoder, as the DNS-collector sniffer decodes
+	ts := time.Unix(1700000000, 0)
+	tests := []struct {
+		name    string
+		payload int
+		count   int
+		frag    func(i int, payload []byte) gopacket.Packet
+	}{
+		{"IPv4 small", 8, 100000, func(i int, p []byte) gopacket.Packet {
+			return newIPv4Fragment(t, net.IP{10, 1, byte(i >> 8), byte(i)}, uint16(i), 185, true, p, ts)
+		}},
+		{"IPv4 large", 1400, 20000, func(i int, p []byte) gopacket.Packet {
+			return newIPv4Fragment(t, net.IP{10, 1, byte(i >> 8), byte(i)}, uint16(i), 185, true, p, ts)
+		}},
+		{"IPv6 small", 8, 100000, func(i int, p []byte) gopacket.Packet {
+			return newIPv6Fragment(t, uint32(i), 185, true, p, ts)
+		}},
+		{"IPv6 large", 1400, 20000, func(i int, p []byte) gopacket.Packet {
+			return newIPv6Fragment(t, uint32(i), 185, true, p, ts)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, tc.payload)
+			defragger := NewIPDefragmenter()
+			before := liveHeap()
+			for i := 0; i < tc.count; i++ {
+				_, _ = defragger.DefragIP(dec.decode(tc.frag(i, payload)))
+			}
+			grown := liveHeap() - before
+			runtime.KeepAlive(defragger)
+			t.Logf("heap grew %d KiB, limit %d KiB", grown>>10, IPFragmentMemoryLimit>>10)
+
+			// The accounting is an estimate, so allow 50% over the limit.
+			if limit := int64(IPFragmentMemoryLimit) * 3 / 2; grown > limit {
+				t.Errorf("heap grew %d KiB for %d incomplete flows, want at most %d KiB", grown>>10, tc.count, limit>>10)
+			}
+		})
+	}
+}
+
+// liveHeap returns the heap in use after a full garbage collection.
+func liveHeap() int64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return int64(m.HeapAlloc)
+}
+
+// A flow must expire IPFragmentTimeout after its first fragment, as in Linux,
+// even if it keeps getting fragments. Else a sender keeps a flow alive with
+// one duplicate per timeout.
+func TestIpDefrag_TimeoutStartsAtFirstFragment(t *testing.T) {
+	forEachDecoder(t, func(t *testing.T, dec testDecoder) {
+		defragger := NewIPDefragmenter()
+		start := time.Unix(1700000000, 0)
+		src := net.IP{10, 0, 0, 1}
+		frag := func(id uint16, offset uint16, ts time.Time) {
+			if _, err := defragger.DefragIP(dec.newIPv4Fragment(t, src, id, offset, true, make([]byte, 8), ts)); err != nil {
+				t.Fatal(err)
+			}
+			checkDefragmenter(t, defragger)
+		}
+
+		frag(1, 1, start)
+		frag(1, 1, start.Add(20*time.Second)) // duplicate
+		frag(1, 2, start.Add(25*time.Second)) // new data
+		frag(2, 1, start.Add(IPFragmentTimeout+time.Second))
+		if _, ok := defragger.ipFlows[newIPv4(dec.newIPv4Fragment(t, src, 1, 1, true, make([]byte, 8), start))]; ok {
+			t.Errorf("flow still tracked %v after its first fragment", IPFragmentTimeout+time.Second)
+		}
+		if n := len(defragger.ipFlows); n != 1 {
+			t.Errorf("%d flows tracked, want 1", n)
+		}
+	})
 }
